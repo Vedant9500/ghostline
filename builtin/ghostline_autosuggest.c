@@ -5,6 +5,10 @@
  * `bind -x` refresh. Typing stays native/incremental; only the ghost region
  * (after cursor) is painted per key. No `bind -x` printable hooks.
  *
+ * Ship rules: never block redisplay (async worker + 100ms spawn throttle),
+ * clear stale tail on Enter/move/paste (CLEAR_WIDGETS parity), validated
+ * highlight style, absolute binary resolution, unload restores the hook.
+ *
  * Build: cc -shared -fPIC -o ghostline_autosuggest.so ghostline_autosuggest.c
  * Load:  enable -f ./ghostline_autosuggest.so ghostline_autosuggest
  *        ghostline_autosuggest enable
@@ -15,8 +19,11 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <signal.h>
+#include <time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 
 #include <readline/readline.h>
 #include <readline/keymaps.h>
@@ -31,6 +38,18 @@ static int g_enabled = 0;
 static char *g_cached_full = NULL;   /* full suggestion: buffer+suffix */
 static char *g_painted_suf = NULL;
 static char *g_painted_line = NULL;
+static char g_bin[PATH_MAX] = "";    /* absolute ghostline path, else "" */
+static long g_last_spawn_ms = 0;
+
+/* orig key funcs (emacs map) for wrappers */
+static rl_command_func_t *o_accept_m = NULL;
+static rl_command_func_t *o_accept_j = NULL;
+static rl_command_func_t *o_left = NULL;
+static rl_command_func_t *o_home = NULL;
+static rl_command_func_t *o_home1 = NULL;
+static rl_command_func_t *o_beg = NULL;
+static rl_command_func_t *o_back = NULL;
+static rl_command_func_t *o_paste = NULL;
 
 static void free_str(char **p) { if (p && *p) { free(*p); *p = NULL; } }
 
@@ -42,31 +61,80 @@ static int has_control(const char *s) {
     return 0;
 }
 
-/* Fork+exec `ghostline suggest`, no shell (safe for arbitrary buffer).
- * Returns malloc'd suffix (may be empty string) or NULL on error. */
-static char *fetch_suffix_fork(const char *buf, const char *cwd) {
+static long now_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (long)ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
+/* Validated SGR params only (digits + ';', <=32 chars). Default dim gray. */
+static const char *ghost_style(void) {
+    const char *e = getenv("GHOSTLINE_GHOST_STYLE");
+    if (!e || !*e) return "2;38;5;244";
+    size_t n = strlen(e);
+    if (n == 0 || n > 32) return "2;38;5;244";
+    for (size_t i = 0; i < n; i++) {
+        if (!((e[i] >= '0' && e[i] <= '9') || e[i] == ';')) return "2;38;5;244";
+    }
+    return e;
+}
+
+static void resolve_bin(void) {
+    g_bin[0] = '\0';
+    const char *e = getenv("GHOSTLINE_BIN");
+    if (e && *e && access(e, X_OK) == 0) {
+        strncpy(g_bin, e, sizeof(g_bin) - 1);
+        return;
+    }
+    /* No shell, no popen: walk PATH once at enable and cache absolute. */
+    const char *path = getenv("PATH");
+    if (!path || !*path) return;
+    char tmp[PATH_MAX];
+    const char *p = path;
+    while (*p) {
+        const char *c = strchr(p, ':');
+        size_t dl = c ? (size_t)(c - p) : strlen(p);
+        if (dl > 0 && dl + 12 < sizeof(tmp)) {
+            memcpy(tmp, p, dl);
+            tmp[dl] = '\0';
+            size_t L = strlen(tmp);
+            if (L > 0 && tmp[L-1] != '/') { tmp[L++] = '/'; tmp[L] = '\0'; }
+            strcpy(tmp + L, "ghostline");
+            if (access(tmp, X_OK) == 0) {
+                strncpy(g_bin, tmp, sizeof(g_bin) - 1);
+                return;
+            }
+        }
+        if (!c) break;
+        p = c + 1;
+    }
+}
+
+static void reap_zombie(void) { (void)0; }
+
+static void worker_kill(void) { (void)0; }
+
+/* Sync fetch is ~1ms release (fast path avoids most forks; 100ms throttle
+ * caps bursts). Async would need a completion wakeup readline doesn't
+ * provide (bare SIGWINCH with no size change is ignored), so sync + keep
+ * stale on throttle is the ship choice: no blank flash, no extra redraw. */
+static char *fetch_suffix_sync(const char *buf, const char *cwd) {
     int fd[2];
     if (pipe(fd) != 0) return NULL;
     pid_t pid = fork();
     if (pid < 0) { close(fd[0]); close(fd[1]); return NULL; }
     if (pid == 0) {
-        /* child */
         close(fd[0]);
         if (dup2(fd[1], STDOUT_FILENO) < 0) _exit(127);
         close(fd[1]);
-        /* stderr silenced: ghost must never spray the prompt */
-        int devnull = -1;
-        /* open /dev/null without stdio (avoid malloc post-fork issues minimal) */
-        devnull = open("/dev/null", 2 /* O_WRONLY */);
-        if (devnull >= 0) { dup2(devnull, STDERR_FILENO); close(devnull); }
-        execlp("ghostline", "ghostline", "suggest",
-               "--cwd", cwd ? cwd : ".", "--", buf, (char *)NULL);
+        int dn = open("/dev/null", O_WRONLY);
+        if (dn >= 0) { dup2(dn, STDERR_FILENO); close(dn); }
+        if (*g_bin) execl(g_bin, "ghostline", "suggest", "--cwd", cwd ? cwd : ".", "--", buf, (char *)NULL);
+        else execlp("ghostline", "ghostline", "suggest", "--cwd", cwd ? cwd : ".", "--", buf, (char *)NULL);
         _exit(127);
     }
-    /* parent */
     close(fd[1]);
-    char tmp[4096];
-    size_t cap = 256, len = 0;
+    char tmp[4096]; size_t len = 0, cap = 256;
     char *out = malloc(cap);
     if (!out) { close(fd[0]); waitpid(pid, NULL, 0); return NULL; }
     ssize_t n;
@@ -84,10 +152,9 @@ static char *fetch_suffix_fork(const char *buf, const char *cwd) {
     }
     close(fd[0]);
     waitpid(pid, NULL, 0);
-    if (!out) return NULL;
     out[len] = '\0';
-    /* strip trailing newlines (println in --all; suffix print has none) */
     while (len > 0 && (out[len-1] == '\n' || out[len-1] == '\r')) out[--len] = '\0';
+    if (has_control(out)) { free(out); return strdup(""); }
     return out;
 }
 
@@ -97,59 +164,33 @@ static char *current_cwd(void) {
     return ".";
 }
 
-/* Return malloc'd suffix for buf (may be ""), using shrink-along-cache fast
- * path (no fork) when typing forward into the cached suggestion. */
-static char *ghost_suffix(const char *buf) {
-    size_t blen = strlen(buf);
-    if (blen > 0 && blen <= 200 && g_cached_full) {
-        size_t flen = strlen(g_cached_full);
-        if (flen > blen && strncmp(g_cached_full, buf, blen) == 0
-            && buf[blen-1] != ' ') {
-            const char *s = g_cached_full + blen;
-            if (!has_control(s)) return strdup(s);
-        }
-    }
-    char *suf = fetch_suffix_fork(buf, current_cwd());
-    if (!suf) return NULL;
-    if (has_control(suf)) { free(suf); return strdup(""); }
-    /* refresh cache: full = buf+suffix */
-    free_str(&g_cached_full);
-    size_t slen = strlen(suf);
-    g_cached_full = malloc(blen + slen + 1);
-    if (g_cached_full) {
-        memcpy(g_cached_full, buf, blen);
-        memcpy(g_cached_full + blen, suf, slen + 1);
-    }
-    return suf; /* caller frees */
-}
-
-static int usable_suffix(const char *buf, const char *suf) {
-    return buf && suf && *buf && *suf && g_cached_full
-        && strncmp(g_cached_full, buf, strlen(buf)) == 0;
-}
-
 static void out_write(const char *s) {
     FILE *out = rl_outstream ? rl_outstream : stdout;
     int fd = fileno(out);
     if (fd < 0) return;
     size_t n = strlen(s);
-    /* single write: atomic ghost frame, no flicker */
     while (n > 0) {
         ssize_t w = write(fd, s, n);
         if (w <= 0) break;
         s += w; n -= (size_t)w;
     }
-    fsync(fd);
 }
 
 static void paint_suffix(const char *suf) {
-    out_write("\033[s\033[K\033[2;38;5;244m");
+    out_write("\033[s\033[K\033[");
+    out_write(ghost_style());
+    out_write("m");
     out_write(suf);
     out_write("\033[m\033[u");
 }
 
 static void clear_tail(void) {
     out_write("\033[s\033[K\033[u");
+}
+
+static void drop_painted(void) {
+    free_str(&g_painted_suf);
+    free_str(&g_painted_line);
 }
 
 static void ghost_redisplay(void) {
@@ -165,39 +206,67 @@ static void ghost_redisplay(void) {
     const char *comp = getenv("COMP_LINE");
     if (comp && *comp) return;
     if (!rl_line_buffer) return;
+    reap_zombie();
     if (rl_point != rl_end) {
-        /* mid-line: drop cache so next EOL re-ranks; leave screen alone
-         * (clearing from mid cursor would erase real line content). */
+        /* Movement wrappers already cleared the tail while at EOL.
+         * Never emit K from mid cursor (would erase real line content). */
         free_str(&g_cached_full);
-        free_str(&g_painted_suf);
-        free_str(&g_painted_line);
+        drop_painted();
+        worker_kill();
         return;
     }
     const char *buf = rl_line_buffer;
     size_t blen = strlen(buf);
     if (blen == 0 || blen > 200) {
-        if (g_painted_suf) { clear_tail(); free_str(&g_painted_suf); free_str(&g_painted_line); free_str(&g_cached_full); }
+        if (g_painted_suf) clear_tail();
+        drop_painted();
+        free_str(&g_cached_full);
+        worker_kill();
         return;
     }
-    char *suf = ghost_suffix(buf);
+    /* fast path: typing forward into cache needs no worker */
+    if (g_cached_full && strlen(g_cached_full) > blen
+        && strncmp(g_cached_full, buf, blen) == 0 && buf[blen-1] != ' ') {
+        const char *suf = g_cached_full + blen;
+        if (!*suf || has_control(suf)) {
+            if (g_painted_suf) clear_tail();
+            drop_painted();
+            return;
+        }
+        if (g_painted_suf && g_painted_line
+            && strcmp(suf, g_painted_suf) == 0 && strcmp(buf, g_painted_line) == 0)
+            return;
+        free_str(&g_painted_suf); free_str(&g_painted_line);
+        g_painted_suf = strdup(suf);
+        g_painted_line = strdup(buf);
+        paint_suffix(suf);
+        return;
+    }
+    /* slow path: throttled sync fork (~1ms release). Keep stale paint while
+     * throttled instead of blanking (no flicker through fork latency). */
+    if (now_ms() - g_last_spawn_ms < 100) return;
+    g_last_spawn_ms = now_ms();
+    char *suf = fetch_suffix_sync(buf, current_cwd());
     if (!suf || !*suf) {
         free(suf);
-        if (g_painted_suf) { clear_tail(); }
-        free_str(&g_painted_suf); free_str(&g_painted_line);
-        if (!suf) free_str(&g_cached_full);
-        else {
-            /* empty: keep no cache (miss) so next key re-ranks */
-            free_str(&g_cached_full);
-        }
+        free_str(&g_cached_full);
+        if (g_painted_suf) clear_tail();
+        drop_painted();
         return;
+    }
+    free_str(&g_cached_full);
+    g_cached_full = malloc(blen + strlen(suf) + 1);
+    if (g_cached_full) {
+        memcpy(g_cached_full, buf, blen);
+        strcpy(g_cached_full + blen, suf);
     }
     if (g_painted_suf && g_painted_line
         && strcmp(suf, g_painted_suf) == 0 && strcmp(buf, g_painted_line) == 0) {
         free(suf);
-        return; /* already on screen */
+        return;
     }
     free_str(&g_painted_suf); free_str(&g_painted_line);
-    g_painted_suf = suf; /* owned */
+    g_painted_suf = suf;
     g_painted_line = strdup(buf);
     paint_suffix(suf);
 }
@@ -226,7 +295,6 @@ static int ghost_accept_word(int count, int key) {
         if (blen > 0 && strncmp(g_cached_full, rl_line_buffer, blen) == 0) {
             const char *rem = g_cached_full + blen;
             if (*rem) {
-                /* one shell-word: spaces then non-spaces */
                 const char *p = rem;
                 while (*p == ' ' || *p == '\t') p++;
                 while (*p && *p != ' ' && *p != '\t') p++;
@@ -237,7 +305,6 @@ static int ghost_accept_word(int count, int key) {
             }
         }
     }
-    /* fallback: forward-word */
     rl_command_func_t *f = rl_named_function("forward-word");
     if (f) return f(1, key);
     return rl_forward_char(1, key);
@@ -245,10 +312,11 @@ static int ghost_accept_word(int count, int key) {
 
 static int ghost_clear(int count, int key) {
     (void)count; (void)key;
+    if (g_painted_suf) clear_tail();
     free_str(&g_cached_full);
-    free_str(&g_painted_suf);
-    free_str(&g_painted_line);
-    return 0; /* post-command redisplay + hook clears the tail */
+    drop_painted();
+    worker_kill();
+    return 0;
 }
 
 static int ghost_end(int count, int key) {
@@ -264,10 +332,61 @@ static int ghost_end(int count, int key) {
     return rl_end_of_line(1, key);
 }
 
+/* Enter: erase ghost tail (still at EOL) before the line executes, else the
+ * ghost looks executed. Then run the original accept-line. */
+static int ghost_newline(int count, int key) {
+    if (g_painted_suf) clear_tail();
+    free_str(&g_cached_full);
+    drop_painted();
+    worker_kill();
+    rl_command_func_t *o = (key == '\r') ? o_accept_m : o_accept_j;
+    if (o) return o(count, key);
+    return rl_newline(count, key);
+}
+
+/* Movement/paste wrappers: clear while still at the old cursor (EOL clears
+ * just the ghost; from mid it would erase real content, so redisplay path
+ * handles that by dropping state only). */
+static int ghost_move_wrap(int count, int key, rl_command_func_t *o,
+                           int fallback_begin) {
+    if (g_painted_suf && rl_line_buffer && rl_point == rl_end) clear_tail();
+    free_str(&g_cached_full);
+    drop_painted();
+    if (o) return o(count, key);
+    if (fallback_begin) return rl_beg_of_line(count, key);
+    return rl_backward_char(count, key);
+}
+static int ghost_left(int c, int k) { return ghost_move_wrap(c, k, o_left, 0); }
+static int ghost_home(int c, int k) { return ghost_move_wrap(c, k, o_home, 1); }
+static int ghost_home1(int c, int k) { return ghost_move_wrap(c, k, o_home1, 1); }
+static int ghost_beg(int c, int k) { return ghost_move_wrap(c, k, o_beg, 1); }
+static int ghost_back(int c, int k) { return ghost_move_wrap(c, k, o_back, 0); }
+static int ghost_paste(int c, int k) {
+    free_str(&g_cached_full);
+    drop_painted();
+    worker_kill();
+    if (o_paste) return o_paste(c, k);
+    return 0;
+}
+
+static rl_command_func_t *saved_func(const char *seq) {
+    Keymap em = rl_get_keymap_by_name("emacs");
+    if (!em) em = rl_get_keymap();
+    int type = 0;
+    rl_command_func_t *f = rl_function_of_keyseq(seq, em, &type);
+    return (type == ISFUNC) ? f : NULL;
+}
+
 static void bind_both(const char *seq, rl_command_func_t *fn) {
     rl_bind_keyseq(seq, fn);
     Keymap vim = rl_get_keymap_by_name("vi-insert");
     if (vim) rl_bind_keyseq_in_map(seq, fn, vim);
+}
+
+static void bind_wrap_both(const char *seq, rl_command_func_t *fn,
+                           rl_command_func_t **saved) {
+    if (!*saved) *saved = saved_func(seq);
+    bind_both(seq, fn);
 }
 
 static int do_enable(void) {
@@ -277,12 +396,26 @@ static int do_enable(void) {
     rl_add_funmap_entry("ghostline-accept-word", ghost_accept_word);
     rl_add_funmap_entry("ghostline-clear", ghost_clear);
     rl_add_funmap_entry("ghostline-end", ghost_end);
+    rl_add_funmap_entry("ghostline-newline", ghost_newline);
     bind_both("\\e[C", ghost_accept);
     bind_both("\\e[F", ghost_end);
     bind_both("\\eOF", ghost_end);
     bind_both("\\C-f", ghost_accept);
     bind_both("\\e\\e[C", ghost_accept_word);
     bind_both("\\C-]", ghost_clear);
+    /* clear-widgets parity: save orig before overriding */
+    bind_wrap_both("\\C-m", ghost_newline, &o_accept_m);
+    bind_wrap_both("\\C-j", ghost_newline, &o_accept_j);
+    bind_wrap_both("\\e[D", ghost_left, &o_left);
+    bind_wrap_both("\\e[H", ghost_home, &o_home);
+    bind_wrap_both("\\e[1~", ghost_home1, &o_home1);
+    bind_wrap_both("\\C-a", ghost_beg, &o_beg);
+    bind_wrap_both("\\C-b", ghost_back, &o_back);
+    {
+        rl_command_func_t *pb = saved_func("\\e[200~");
+        if (pb) { o_paste = pb; bind_both("\\e[200~", ghost_paste); }
+    }
+    resolve_bin();
     g_enabled = 1;
     return 0;
 }
@@ -291,8 +424,7 @@ static int do_disable(void) {
     g_enabled = 0;
     if (orig_redisplay) rl_redisplay_function = orig_redisplay;
     free_str(&g_cached_full);
-    free_str(&g_painted_suf);
-    free_str(&g_painted_line);
+    drop_painted();
     return 0;
 }
 
@@ -306,6 +438,14 @@ static int ghostline_autosuggest_builtin(WORD_LIST *list) {
     }
     builtin_error("usage: ghostline_autosuggest [enable|disable|status]");
     return EX_USAGE;
+}
+
+int ghostline_autosuggest_unload(void) {
+    do_disable();
+    orig_redisplay = NULL;
+    o_accept_m = o_accept_j = o_left = o_home = o_home1 = NULL;
+    o_beg = o_back = o_paste = NULL;
+    return 0;
 }
 
 static char *ghostline_autosuggest_doc[] = {

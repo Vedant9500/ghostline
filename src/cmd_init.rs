@@ -348,8 +348,12 @@ mod tests {
         use std::process::Stdio;
         // --norc + unset guard: the ambient ~/.bashrc may eval a stale
         // ghostline whose _GHOSTLINE_GHOST_INITED would skip our install.
+        // Isolated PATH: the test machine may have ghostline_autosuggest.so
+        // installed system-wide, which would flip the snippet into native
+        // mode (no shell binds). Force fallback to test the shell path.
         let out = std::process::Command::new("bash")
             .args(["--norc", "-i", "-c", &format!("unset _GHOSTLINE_GHOST_INITED; source {snip_s}; bind -m emacs -X")])
+            .env("PATH", "/usr/bin:/bin")
             .stdin(Stdio::null())
             .output()
             .expect("bash -i bind -X");

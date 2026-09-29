@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Pty end-to-end for ghostline bash ghost: real keypresses, not function calls.
 
-Catches what scripted tests cannot: readline macro recursion
-("maximum macro execution nesting level exceeded").
+Catches what scripted tests cannot: per-char whole-line refresh flicker
+(`\\r\\e[K\\rP> ...` per keystroke from `bind -x` printable hooks).
 
 Args: <snippet> <ghostline-bin> <workdir>
 Asserts:
-  1. typing a known prefix paints the dim ghost, no macro errors
-  2. Right-arrow accepts the ghost, Enter runs the accepted command
+  1. typing a known prefix does NOT whole-line-refresh per char (native
+     self-insert, no `bind -x` printable hooks) and no macro errors
+  2. Ctrl-G previews the dim ghost on demand (deferred past redisplay)
+  3. Right-arrow accepts the ghost, Enter runs the accepted command
 """
 import os
 import pty
@@ -77,9 +79,19 @@ send(f"cd {workdir}\n".encode(), 0.8)
 out = b""  # drop startup noise
 for ch in b"echo hello":
     send(bytes([ch]), 0.25)
+typing_phase = bytes(out)
 
 check("no macro nesting error", b"nesting level" not in out)
-check("ghost painted dim", b"\x1b[2;" in out and b"-world-xyz" in out)
+# Flicker guard: native typing must not full-redisplay per char. Old per-char
+# `bind -x` produced one `\r\e[K` per keystroke (10 chars -> ~10). On-demand
+# keeps typing native: expect ~0 during the typing phase.
+n_redraw = typing_phase.count(b"\r\x1b[K")
+check("typing has no whole-line refresh", n_redraw <= 1, f"redraws={n_redraw}")
+check("no auto-ghost before preview", b"-world-xyz" not in typing_phase)
+
+send(b"\x07", 1.0)  # Ctrl-G: on-demand preview (deferred past redisplay)
+check("ghost painted dim on preview", b"\x1b[2;" in out and b"-world-xyz" in out)
+check("no job spam on preview", b"[1]" not in out)
 
 send(b"\x1b[C", 0.6)  # Right arrow: accept full ghost
 send(b"\r", 1.0)  # Enter: run accepted command

@@ -48,9 +48,17 @@ if [ -z "${_GHOSTLINE_GHOST_INITED:-}" ] && [ "${GHOSTLINE_GHOST:-1}" != "0" ] &
   _GHOSTLINE_PAINTED_LINE=""
 
   # Recompute ghost for current line; paints dim suffix WITHOUT touching READLINE_LINE.
-  # Fast path: typing along the cached suggestion needs NO fork — shrink and
-  # repaint synchronously, so no stale/wrong frame ever appears. Full re-rank
-  # (fork) happens on diverge, empty cache, or token boundary (trailing space).
+  # Typing stays native (no per-char bind -x): ANY bind -x forces readline to
+  # do a full-line redisplay (`\r\e[K\rP> ...`) per keystroke vs 1 byte for
+  # native self-insert (measured 2x bytes empty, ~6x with ghost). Per-char
+  # auto-ghost therefore flickers by construction in bash (no POSTDISPLAY).
+  # On-demand preview (Ctrl-G / Right at EOL) + native typing preserves a
+  # matching ghost tail with zero repaint (typed char overwrites same ghost
+  # char); diverge/backspace refresh via the edit bindings below.
+  # Paint is deferred past readline's redisplay via double-subshell
+  # ((sleep; printf)&) so it lands AFTER `P> line` at the cursor (correct
+  # column) with no `[1]` job spam. Sync paint before redisplay gets
+  # overwritten by `P> line` (misaligned by prompt width, then invisible).
   _ghostline_ghost() {
     [ "${GHOSTLINE_GHOST:-1}" = "0" ] && return 0
     [ -n "${GHOSTLINE_DISABLED:-}" ] && return 0
@@ -65,22 +73,17 @@ if [ -z "${_GHOSTLINE_GHOST_INITED:-}" ] && [ "${GHOSTLINE_GHOST:-1}" != "0" ] &
        && [ "${line: -1}" != " " ]; then
       suf="${_GHOSTLINE_SUGGEST#$line}"
     else
-      # Slow path: throttle forks to ~10Hz during burst typing (ble.sh uses a
-      # 100ms idle delay for the same reason). A skipped fork keeps the old
-      # ghost briefly stale instead of flickering through fork latency.
-      # (fish does this with background threads; bash has no hook for that,
-      # so time-throttle is the closest equivalent.)
+      # Slow path: throttle forks to ~10Hz (held Backspace auto-repeat).
+      # No erase-before-fork: readline's own `\r\e[K` after -x already clears
+      # stale ghost; an extra `\e[K` at col 0 before redisplay blanks the
+      # whole line (flash). Stale stays ~1ms during the fork, then the
+      # deferred paint overwrites it.
       if [ -n "${EPOCHREALTIME:-}" ]; then
         local now_ms=$(( ${EPOCHREALTIME/./} / 1000 ))
         if [ $(( now_ms - ${_GHOSTLINE_LAST_FORK:-0} )) -lt 100 ]; then
           return 0
         fi
         _GHOSTLINE_LAST_FORK=$now_ms
-      fi
-      # Erase stale ghost BEFORE the fork so no wrong text lingers.
-      if [ -n "${_GHOSTLINE_PAINTED:-}" ]; then
-        _GHOSTLINE_PAINTED=""; _GHOSTLINE_PAINTED_LINE=""
-        printf '\e[K'
       fi
       suf=$(command ghostline suggest --cwd "$PWD" -- "$line" 2>/dev/null)
       _GHOSTLINE_SUGGEST="$line$suf"
@@ -94,7 +97,12 @@ if [ -z "${_GHOSTLINE_GHOST_INITED:-}" ] && [ "${GHOSTLINE_GHOST:-1}" != "0" ] &
     fi
     _GHOSTLINE_PAINTED="$suf"
     _GHOSTLINE_PAINTED_LINE="$line"
-    printf '\e[s\e[K\e[2;38;5;244m%s\e[m\e[u' "$suf"
+    # Deferred past redisplay (see header): correct column, no job spam.
+    ((sleep 0.03; printf '\e[s\e[K\e[2;38;5;244m%s\e[m\e[u' "$suf") &)
+  }
+
+  _ghostline_preview() {  # Ctrl-G: explicit fetch (typing itself is native, no hook)
+    _ghostline_ghost
   }
 
   _ghostline_has_usable() {
@@ -102,11 +110,13 @@ if [ -z "${_GHOSTLINE_GHOST_INITED:-}" ] && [ "${GHOSTLINE_GHOST:-1}" != "0" ] &
       && [ "$READLINE_POINT" -eq "${#READLINE_LINE}" ]
   }
 
-  _ghostline_accept() {  # Right / Ctrl-F: accept full at EOL, else forward-char
+  _ghostline_accept() {  # Right / Ctrl-F: accept at EOL, fetch-preview when empty, else forward-char
     if _ghostline_has_usable; then
       READLINE_LINE="$_GHOSTLINE_SUGGEST"
       READLINE_POINT=${#READLINE_LINE}
       _ghostline_ghost
+    elif [ "$READLINE_POINT" -eq "${#READLINE_LINE}" ] && [ -n "$READLINE_LINE" ]; then
+      _ghostline_ghost  # at EOL with no ghost: preview instead of useless step
     else
       READLINE_POINT=$((READLINE_POINT + 1))
       [ "$READLINE_POINT" -gt "${#READLINE_LINE}" ] && READLINE_POINT=${#READLINE_LINE}
@@ -141,10 +151,9 @@ if [ -z "${_GHOSTLINE_GHOST_INITED:-}" ] && [ "${GHOSTLINE_GHOST:-1}" != "0" ] &
     fi
   }
 
-  _ghostline_dismiss() {  # Ctrl-]: drop suggestion, clear paint
+  _ghostline_dismiss() {  # Ctrl-]: drop suggestion (redisplay already clears paint)
     _GHOSTLINE_SUGGEST=""
     _GHOSTLINE_PAINTED=""; _GHOSTLINE_PAINTED_LINE=""
-    printf '\e[K'
   }
 
   _ghostline_bspace() {  # Backspace/C-h: delete + refresh (else ghost goes stale)
@@ -180,28 +189,19 @@ if [ -z "${_GHOSTLINE_GHOST_INITED:-}" ] && [ "${GHOSTLINE_GHOST:-1}" != "0" ] &
   }
   _ghostline_home() { READLINE_POINT=0; }  # Ctrl-A
 
-  # NOTE: printable chars use bind -x insert functions, NOT key macros.
-  # A macro like "a": "a..." is rescanned by readline and retriggers itself
-  # ("maximum macro execution nesting level exceeded" on first keypress).
-  _ghostline_insert() {  # $1 = literal char
-    READLINE_LINE="${READLINE_LINE:0:READLINE_POINT}$1${READLINE_LINE:READLINE_POINT}"
-    READLINE_POINT=$((READLINE_POINT + ${#1}))
-    _ghostline_ghost
-  }
-
+  # NOTE: printable chars are intentionally NOT bound. ANY `bind -x` forces a
+  # full-line redisplay (`\r\e[K\rP> ...`) per keystroke vs 1 byte for native
+  # self-insert — that whole-line refresh per character IS the flicker.
+  # A macro `"a": "a..."` is no escape: readline rescans it and recurses
+  # ("maximum macro execution nesting level exceeded"). Typing stays native;
+  # ghost is on-demand (Ctrl-G / Right at EOL) via _ghostline_ghost above.
   _ghostline_install_map() {
-    local map="$1" i o e fn
-    for (( i=32; i<=126; i++ )); do
-      printf -v o '%03o' "$i"
-      case "$i" in 92) e='\\';; 34) e='\"';; *) printf -v e '%b' "\\$o";; esac
-      fn="_ghostline_k_$i"
-      eval "$fn() { _ghostline_insert \$'\\$o'; }"
-      bind -m "$map" -x "\"$e\": $fn"
-    done
+    local map="$1"
     bind -m "$map" -x '"\e[C": _ghostline_accept'
     bind -m "$map" -x '"\e[F": _ghostline_end'
     bind -m "$map" -x '"\eOF": _ghostline_end'
     bind -m "$map" -x '"\C-f": _ghostline_accept'
+    bind -m "$map" -x '"\C-g": _ghostline_preview'
     bind -m "$map" -x '"\e\e[C": _ghostline_accept_word'
     bind -m "$map" -x '"\C-]": _ghostline_dismiss'
     bind -m "$map" -x '"\C-?": _ghostline_bspace'
@@ -323,12 +323,13 @@ mod tests {
         );
         assert!(stdout.contains("all ok"), "unexpected output: {stdout}");
 
-        // 3. all 95 per-char -x bindings installed (needs line editing -> bash -i).
-        // NOTE: printable chars use bind -x insert functions, NOT macros:
-        // self-referential macros rescan and recurse ("maximum macro execution
-        // nesting level exceeded"). Macros would appear under `bind -S`;
+        // 3. NO per-char -x bindings (needs line editing -> bash -i).
+        // ANY `bind -x` forces a full-line redisplay (`\r\e[K\rP> ...`) per
+        // keystroke vs 1 byte native self-insert — that whole-line refresh
+        // per character IS the flicker. Printable chars must stay native.
         // -x bindings appear under `bind -X`.
-        // Regression guard: backslash key (code 92) must be bound.
+        // Regression guards: no `_ghostline_k_*`, no `_ghostline_insert`,
+        // but preview (`_ghostline_preview` on Ctrl-G) must be bound.
         use std::process::Stdio;
         // --norc + unset guard: the ambient ~/.bashrc may eval a stale
         // ghostline whose _GHOSTLINE_GHOST_INITED would skip our install.
@@ -339,10 +340,21 @@ mod tests {
             .expect("bash -i bind -X");
         let listing = String::from_utf8_lossy(&out.stdout);
         let nkeys = listing.lines().filter(|l| l.contains("_ghostline_k_")).count();
-        assert!(nkeys >= 95, "only {nkeys} per-char bindings installed:\n{listing}");
         assert!(
-            listing.contains("_ghostline_k_92"),
-            "backslash key binding missing from emacs map"
+            nkeys == 0,
+            "per-char bindings cause whole-line refresh flicker, must be 0 (got {nkeys}):\n{listing}"
+        );
+        assert!(
+            !listing.contains("_ghostline_insert"),
+            "insert fn forces full redisplay per char:\n{listing}"
+        );
+        assert!(
+            listing.contains("_ghostline_preview"),
+            "on-demand preview (Ctrl-G) missing:\n{listing}"
+        );
+        assert!(
+            listing.contains("_ghostline_accept"),
+            "accept binding missing:\n{listing}"
         );
 
         std::fs::remove_dir_all(&dir).ok();

@@ -105,5 +105,5 @@ fi
 
 echo ""
 echo "Done. Open a new terminal (any of them — Alacritty, Kitty, etc.) and type a known command prefix."
-echo "Ghost text appears dim; Right-arrow accepts, Alt-Right accepts a word, Ctrl-] dismisses."
-echo "Disable ghost any time: export GHOSTLINE_GHOST=0. Pause logging: export GHOSTLINE_DISABLED=1."
+echo "Press Ctrl-G or Right-arrow at end of line to preview dim ghost; Right-arrow accepts, Alt-Right accepts a word, Ctrl-] dismisses."
+echo "Typing stays native (no per-char refresh flicker). Disable ghost any time: export GHOSTLINE_GHOST=0. Pause logging: export GHOSTLINE_DISABLED=1."

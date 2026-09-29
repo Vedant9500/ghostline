@@ -8,6 +8,7 @@
 - Style: `region_highlight+=("$#BUFFER $(( $#BUFFER + $#POSTDISPLAY )) fg=244,dim")`. Never embed ANSI in `POSTDISPLAY` (prints literally on zsh 5.9 macOS).
 - Widget wrap: save `orig_buffer/orig_postdisplay`, `unset POSTDISPLAY`, call original, skip fetch if `PENDING>0 || KEYS_QUEUED_COUNT>0` (zsh ≥5.4).
 - Fast-path: if typing forward into suggestion (`BUFFER == orig_buffer*` and remainder matches), shrink `POSTDISPLAY` without re-query.
+- Bash implements the same fast path fork-free (shrink cached suffix locally; re-rank only on diverge, empty cache, or token boundary). Rationale: measured ~6x terminal byte traffic repainting per key, and the fork latency shows a stale-ghost frame that reads as flicker.
 - Strategies: `history` (reverse scan) sync <2ms; `completion` async via `zpty` only. History ghost must have zero debounce.
 - Guards: `BUFFER_MAX_SIZE=20–50` skips paste/large buffers; `MANUAL_REBIND` for perf; single-owner `POSTDISPLAY` (clashes with Deja-style plugins).
 

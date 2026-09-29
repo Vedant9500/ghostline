@@ -5,9 +5,11 @@
  * `bind -x` refresh. Typing stays native/incremental; only the ghost region
  * (after cursor) is painted per key. No `bind -x` printable hooks.
  *
- * Ship rules: never block redisplay (async worker + 100ms spawn throttle),
- * clear stale tail on Enter/move/paste (CLEAR_WIDGETS parity), validated
- * highlight style, absolute binary resolution, unload restores the hook.
+ * Ship rules: fast-path cache (no fork when typing into the cached
+ * suggestion); slow-path fork on every diverge (~1ms release, no extra
+ * redraw, so no throttle — throttling leaves the old tail on screen while
+ * native insertion overwrites its first char, rendering garbage like
+ * `co`+`lear` → `coear`. Every redisplay must end with correct paint.
  *
  * Build: cc -shared -fPIC -o ghostline_autosuggest.so ghostline_autosuggest.c
  * Load:  enable -f ./ghostline_autosuggest.so ghostline_autosuggest
@@ -20,7 +22,6 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
-#include <time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
@@ -39,7 +40,6 @@ static char *g_cached_full = NULL;   /* full suggestion: buffer+suffix */
 static char *g_painted_suf = NULL;
 static char *g_painted_line = NULL;
 static char g_bin[PATH_MAX] = "";    /* absolute ghostline path, else "" */
-static long g_last_spawn_ms = 0;
 
 /* orig key funcs (emacs map) for wrappers */
 static rl_command_func_t *o_accept_m = NULL;
@@ -59,12 +59,6 @@ static int has_control(const char *s) {
         if (c < 0x20 || c == 0x7f) return 1;
     }
     return 0;
-}
-
-static long now_ms(void) {
-    struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
-    return (long)ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
 }
 
 /* Validated SGR params only (digits + ';', <=32 chars). Default dim gray. */
@@ -114,10 +108,10 @@ static void reap_zombie(void) { (void)0; }
 
 static void worker_kill(void) { (void)0; }
 
-/* Sync fetch is ~1ms release (fast path avoids most forks; 100ms throttle
- * caps bursts). Async would need a completion wakeup readline doesn't
- * provide (bare SIGWINCH with no size change is ignored), so sync + keep
- * stale on throttle is the ship choice: no blank flash, no extra redraw. */
+/* Sync fetch is ~1ms release and causes no redraw (ghost region only), so
+ * fork on every diverge: every redisplay ends with correct paint or a clean
+ * clear. A throttle here would leave the stale tail visible while the newly
+ * typed char overwrites its first byte (renders e.g. `coear`). */
 static char *fetch_suffix_sync(const char *buf, const char *cwd) {
     int fd[2];
     if (pipe(fd) != 0) return NULL;
@@ -242,10 +236,8 @@ static void ghost_redisplay(void) {
         paint_suffix(suf);
         return;
     }
-    /* slow path: throttled sync fork (~1ms release). Keep stale paint while
-     * throttled instead of blanking (no flicker through fork latency). */
-    if (now_ms() - g_last_spawn_ms < 100) return;
-    g_last_spawn_ms = now_ms();
+    /* slow path: fork on every diverge. Fast path above already skips forks
+     * while typing into the cache, so burst cost is bounded by typing rate. */
     char *suf = fetch_suffix_sync(buf, current_cwd());
     if (!suf || !*suf) {
         free(suf);

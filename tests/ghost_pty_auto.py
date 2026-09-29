@@ -6,6 +6,8 @@ Asserts auto-ghost without whole-line-refresh flicker:
   1. typing a known prefix auto-paints dim ghost, no Ctrl-G needed
   2. typing causes ~0 full-line redraws (\\r\\e[K), no [1] job spam, no macro errors
   3. Right-arrow accepts, Enter runs the accepted command
+  4. fast burst (2nd key inside the old 100ms throttle window) still
+     re-ranks: no stale tail interleaved with typed text (`coear` bug)
 
 Args: <snippet> <ghostline-bin> <workdir> <so-path>
 Skips (exit 0, prints SKIP) when the .so is missing.
@@ -38,6 +40,17 @@ subprocess.run(
      "--cwd", workdir, "--session", "pty", "echo hello-world-xyz"],
     check=True, capture_output=True,
 )
+# Markers for the burst test: history-only (deterministic, no PATH
+# dependence). Seeded codex FIRST so `c` ghosts the clear marker (newer
+# last_seen wins ties); then `co` diverges from the cached clear entry and
+# must re-rank via a fresh fork — the old 100ms throttle skipped that fork
+# and left the stale tail (`coear` bug).
+for cmd in ["codex-pty-marker-xyz", "clear-pty-marker-xyz"]:
+    subprocess.run(
+        [gl, "log", "--db", db, "--shell", "bash", "--exit", "0",
+         "--cwd", workdir, "--session", "pty", cmd],
+        check=True, capture_output=True,
+    )
 
 env = dict(
     os.environ,
@@ -74,8 +87,9 @@ def send(data, wait=0.6):
 
 
 drain(1.0)
-send(f"enable -f {so} ghostline_autosuggest\n".encode(), 0.8)
-send(b"ghostline_autosuggest enable\n", 0.8)
+# Pure-C mode: the snippet auto-loads install/ghostline_autosuggest.so
+# itself (same side-by-side layout as a real user install). No manual
+# enable here — that would mix hook + shell-fallback states.
 send(f"source {snippet}\n".encode(), 0.8)
 send(f"cd {workdir}\n".encode(), 0.8)
 out = b""
@@ -91,6 +105,27 @@ check("no job spam", b"[1]" not in out)
 send(b"\x1b[C", 0.6)
 send(b"\r", 1.0)
 check("accepted command ran", b"hello-world-xyz" in out)
+
+# Burst: fire `o` the moment `c`'s ghost paint lands (tight 10ms poll, no
+# wall-time gap guess). Gap from `c`'s fork is ~ms — deep inside the old
+# 100ms throttle window. Ghost must re-rank to the codex marker, not leave
+# the clear tail interleaved (`co` + stale `lear` rendered as `coear`).
+send(b"\x03", 0.5)  # fresh prompt
+out = b""
+os.write(fd, b"c")
+t_end = time.time() + 3.0
+while time.time() < t_end:
+    r, _, _ = select.select([fd], [], [], 0.01)
+    if r:
+        try:
+            out += os.read(fd, 65536)
+        except OSError:
+            break
+    if b"lear-pty-marker-xyz" in out:
+        break
+os.write(fd, b"o")
+drain(0.6)
+check("burst re-ranks ghost", b"dex-pty-marker-xyz" in out and b"\x1b[2;" in out)
 
 try:
     os.write(fd, b"\x03")

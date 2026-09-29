@@ -1,9 +1,11 @@
 mod cmd_daemon;
+mod cmd_fix;
 mod cmd_init;
 mod cmd_log;
 mod cmd_search;
 mod cmd_suggest;
 mod db;
+mod fix;
 mod queue;
 mod redact;
 
@@ -16,11 +18,13 @@ Usage:
   ghostline init <bash|zsh|fish>      print shell hook (eval \"$(ghostline init bash)\")
   ghostline log [flags] <command...>  log one command (or --queue for queue-append)
   ghostline daemon [--once]           drain queue into SQLite (or run loop)
+  ghostline fix [--last] [command...]  did-you-mean repair (exit 0 = found)
   ghostline search [flags] [query]    search history (tab-separated: ts, exit, cwd, cmd)
   ghostline suggest [flags] <buffer>  print ghost suffix for buffer (or --all for full cmds)
 
 log flags:     --shell S --cwd DIR --exit CODE --session ID [--db PATH] [--queue] [--queue-dir D]
 daemon flags:  [--once] [--interval-ms N] [--queue-dir D] [--db PATH]
+fix flags:     [--last] [--exit CODE] [--cwd DIR] [--db P] [-q]
 search flags:  [--limit N] [--dir DIR] [--exit 0|!0] [--session S] [--host H] [--since UNIX] [--db PATH]
 suggest flags: [--cwd DIR] [--limit N] [--all] [--db PATH]
 
@@ -63,6 +67,13 @@ fn main() {
             }
         },
         "daemon" => match cmd_daemon::run(rest) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("error: {e}");
+                1
+            }
+        },
+        "fix" => match cmd_fix::run(rest) {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("error: {e}");

@@ -43,6 +43,18 @@ fi
 # --- ghostline ghost: inline faint suggestion (bash>=4). GHOSTLINE_GHOST=0 disables. ---
 if [ -z "${_GHOSTLINE_GHOST_INITED:-}" ] && [ "${GHOSTLINE_GHOST:-1}" != "0" ] && [ "${BASH_VERSINFO[0]:-0}" -ge 4 ]; then
   _GHOSTLINE_GHOST_INITED=1
+  # Native auto-ghost when the loadable is installed alongside the binary:
+  # readline redisplay hook draws the suffix as part of the normal redisplay
+  # (no extra full-line `bind -x` refresh, no flicker). Fallback below is
+  # on-demand shell (Ctrl-G / Right) with native typing.
+  _GHOSTLINE_SO="$(dirname "$(command -v ghostline 2>/dev/null)")/ghostline_autosuggest.so"
+  if [ -n "${_GHOSTLINE_SO:-}" ] && [ -f "$_GHOSTLINE_SO" ] \
+    && enable -f "$_GHOSTLINE_SO" ghostline_autosuggest 2>/dev/null \
+    && ghostline_autosuggest enable 2>/dev/null; then
+    _GHOSTLINE_NATIVE_AUTO=1
+  else
+    _GHOSTLINE_NATIVE_AUTO=""
+  fi
   _GHOSTLINE_SUGGEST=""
   _GHOSTLINE_PAINTED=""
   _GHOSTLINE_PAINTED_LINE=""
@@ -212,11 +224,14 @@ if [ -z "${_GHOSTLINE_GHOST_INITED:-}" ] && [ "${GHOSTLINE_GHOST:-1}" != "0" ] &
     bind -m "$map" -x '"\C-a": _ghostline_home'
     bind -m "$map" -x '"\C-e": _ghostline_end'
   }
-  if set -o 2>/dev/null | grep -q '^vi[[:space:]]*on'; then
-    _ghostline_install_map emacs
-    _ghostline_install_map vi-insert
-  else
-    _ghostline_install_map emacs
+  # Native hook already owns accept/cursor keys; shell binds would override it.
+  if [ -z "${_GHOSTLINE_NATIVE_AUTO:-}" ]; then
+    if set -o 2>/dev/null | grep -q '^vi[[:space:]]*on'; then
+      _ghostline_install_map emacs
+      _ghostline_install_map vi-insert
+    else
+      _ghostline_install_map emacs
+    fi
   fi
   unset -f _ghostline_install_map
 fi

@@ -66,9 +66,24 @@ fi
 echo "Building ghostline (release)..."
 cargo build --release --manifest-path "$REPO/Cargo.toml"
 
+echo "Building bash native auto-ghost (optional, needs cc + bash headers)..."
+if have cc && [ -f "$REPO/builtin/ghostline_autosuggest.c" ] && [ -f /usr/include/bash/builtins.h ]; then
+  if cc -shared -fPIC -o "$REPO/target/release/ghostline_autosuggest.so" "$REPO/builtin/ghostline_autosuggest.c" -I/usr/include/bash -I/usr/include/bash/include 2>/dev/null; then
+    echo "Built: target/release/ghostline_autosuggest.so (auto-ghost, no flicker)"
+  else
+    echo "NOTE: native auto-ghost build failed — falling back to on-demand shell ghost (Ctrl-G)."
+  fi
+else
+  echo "NOTE: cc/bash headers missing — skipping native auto-ghost (on-demand shell ghost still works)."
+fi
+
 mkdir -p "$PREFIX"
 cp "$REPO/target/release/ghostline" "$PREFIX/ghostline"
 chmod +x "$PREFIX/ghostline"
+if [ -f "$REPO/target/release/ghostline_autosuggest.so" ]; then
+  cp "$REPO/target/release/ghostline_autosuggest.so" "$PREFIX/ghostline_autosuggest.so"
+  echo "Installed: $PREFIX/ghostline_autosuggest.so (auto-ghost)"
+fi
 echo "Installed: $PREFIX/ghostline ($("$PREFIX/ghostline" --version))"
 
 case ":$PATH:" in

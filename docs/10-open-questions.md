@@ -8,7 +8,7 @@
 4. **tldr license surface:** pages are `CC-BY-SA-4.0` — bundling `tldr.en.zip` requires attribution + share-alike notice. Decide: bundle zip vs download-on-first-run vs git-submodule. Include `ATTRIBUTION.md` regardless.
 5. **Ctrl-R stance:** never hijack `↑`; but do we bind `Ctrl-R` to `ghostline search` by default in `init` snippet? Recommendation: opt-in flag (`ghostline init --bind-ctrl-r`), default off.
 6. **Ghost accept keys:** `→` vs `Tab` conflict (Tab = completion). Recommendation: `→`/`End`/`Ctrl-F` accept, `Tab` cycles tldr examples or completes — validate with fish/zsh users.
-7. **Model default:** `Qwen3.5-0.8B q4` (~400MB) vs `Qwen2.5-Coder-1.5B Q4` (~941MB) vs rules-only v1. Recommendation: rules-only v1, model opt-in v1.1. Confirm size tolerance via user survey.
+7. **Model default — PARKED:** local models on hold (memory/compute budget). v1/v1.1 ship NL-rules baseline only. Revisit with fresh research per `09-roadmap.md`.
 8. **Sync scope:** E2EE server vs git-repo sync vs none. Schema reserves UUIDv7/Lamport — but don't promise server dates.
 
 ## Variables to be aware of (validate in test matrix)

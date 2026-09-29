@@ -39,7 +39,7 @@
 - **F8. Next-command prediction:** order-1 Markov `P(next|prev)` backoff; after `git add .` suggest `git commit`; after `mkdir x` suggest `cd x`.
 - **F9. Alias advisor:** `ghostline stats` detects repeated long commands → `alias gco='git checkout'` suggestion; one-command install to rc file.
 - **F10. Stats/insights:** `ghostline stats [--by dir|cmd|hour]` — top cmds, failure rate, slowest, time-of-day. Weekly digest opt-in.
-- **F11. NL-local:** rules (top-100 intents) + bundled small model (Qwen ≤1.5B Q4 via llama.cpp, greedy, 64 tokens, resident daemon to avoid cold start). Fully offline. Cache `normalize(nl)+os+shell → cmd`. See `05-intelligence-engine.md`.
+- **F11. NL-rules baseline (ON HOLD for anything model-based):** rules (top-100 intents) + bundled tldr only. Local GGUF model is parked — breaks the lightweight budget. See `09-roadmap.md`.
 - **F12. Daemon + queue:** `O_APPEND` queue + `ghostline daemon` batching (500 rows/1s), FTS indexing off hot path, systemd/launchd user agent.
 - **F13. Delete/redact tooling:** `ghostline forget <pattern>`, `ghostline forget --last-n`, per-project `.ghostlineignore`.
 
@@ -53,7 +53,7 @@ These came out of research as differentiators. Not v1, tracked here so they aren
 - **F17. Session replay:** `ghostline replay <session>` re-prints a session's successful commands as a runnable script (onboarding / postmortem).
 - **F18. Dotfile-safe export:** `ghostline export --sanitized` for sharing (secrets stripped, home → `~`).
 - **F19. Team cheatsheets:** git-repo `*.cheat` sharing (navi-compatible), no server needed.
-- **F20. Cloud fallback (opt-in):** `--cloud --provider ollama/openai/phind` with pre-send redaction, `--explain`, chat/REPL refine. Never default.
+- **F20. Cloud fallback — ON HOLD:** parked with local models (breaks offline + latency budget). See `09-roadmap.md`.
 - **F21. Voice/hotkey hooks:** documented shell hotkeys (`Ctrl-G` navi-style widget, `Alt-e` NL-prompt) without stealing core binds.
 - **F22. Multi-machine sync (E2EE):** only after daemon + redaction are solid; UUIDv7 + Lamport clock already reserved.
 - **F23. Failure coach:** `ghostline why` explains last non-zero exit (compiles git/stderr `did you mean`, EACCES → sudo hint, ENOENT walk).

@@ -63,7 +63,10 @@ Store: `history(cmd, cwd, exit, duration, ts, host)` + `corrections(typed, accep
 - **Next-cmd Markov order-1:** `P(next|prev)` per cwd-cluster (`git add .`→`git commit`, `vim`→`pytest`). Order-2 with backoff only (`mkdir x→cd x→touch`). Serves as tie-breaker + proactive ghost.
 - **Frecency (Mozilla-adapted):** `freq × recency_boost` — beats pure frequency (atuin/zoxide lesson).
 
-## 6. NL engine (local-first)
+## 6. NL engine (local-first, MODEL PART ON HOLD)
+
+> Decided Sep 2026: rules baseline only. Local-model + cloud rows below are parked research
+> (see `09-roadmap.md`) — kept for future reference, not to build.
 
 Order: exact cache → fuzzy cache → rules (top-100 intents) → local model → (opt-in) cloud.
 

@@ -14,20 +14,33 @@ No daemon, no sync, no model download. Offline rules + tldr bundle only.
 
 Exit criteria: hook <2ms median, cold log <5ms, search <50ms @500k, redaction corpus green, identical ghost UX on 3 shells.
 
-## v1.1 — daemon + local NL
+## v1.1 — daemon + habits (no models, no cloud)
+
+Constraint (decided Sep 2026): stay ultra-light. No resident LLM/GGUF, no cloud calls, nothing that grows
+memory footprint or per-keystroke compute. Model/cloud features are ON HOLD (see below) until research
+shows an option that fits the budget.
 
 - Queue-append + `ghostline daemon` (batch 500/1s, FTS off hot path, systemd/launchd agent, socket-prefer with file fallback).
-- NL-local: bundled `tldr.en.zip` + small GGUF (`Qwen3.5-0.8B q4` default, `Qwen2.5-Coder-1.5B` opt-in) via llama.cpp resident server; SQLite NL cache; `--explain`.
+- NL-rules baseline only (top-100 intents → tldr slot-fill, <5ms, zero deps). No local model.
 - Alias advisor, per-dir habits (F7), next-cmd Markov (F8), weekly stats digest.
 - `ghostline import --from zoxide`, smart-cd resolve, flag tutor.
 
-## v2 — sharing + cloud (opt-in)
+## ON HOLD — models + cloud (needs future research)
+
+Parked because a resident model (400MB–1GB GGUF + server process) and cloud round-trips break the
+lightweight/instant promise (memory, per-keystroke compute, offline-by-default). Revisit only with fresh
+research and a design that fits the budget. Parked items:
+
+- NL-local model (small GGUF via llama.cpp resident server), SQLite NL cache, `--explain`.
+- Cloud fallback `--cloud` (multi-provider, redaction-gated), chat/REPL refine.
+- Larger model option (3–4B), LoRA on user-accepted pairs, semantic cache.
+- Second-model risk review.
+
+## v2 — sharing (no models, no cloud)
 
 - Team `*.cheat` repos (navi-compat), sanitized export, session replay.
-- Cloud fallback `--cloud` (multi-provider, redaction-gated), chat/REPL refine.
 - E2EE multi-machine sync (schema already UUIDv7 + Lamport-ready).
-- Larger model option (3–4B), LoRA on user-accepted pairs, semantic cache.
-- Full gitleaks integration, audit log, second-model risk review.
+- Full gitleaks integration, audit log.
 
 ## Backlog (from brainstorm, unordered)
 

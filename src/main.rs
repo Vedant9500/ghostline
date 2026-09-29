@@ -1,5 +1,6 @@
 mod cmd_bench;
 mod cmd_daemon;
+mod complete;
 mod cmd_fix;
 mod cmd_import;
 mod cmd_init;

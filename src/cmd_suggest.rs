@@ -1,8 +1,11 @@
-use crate::db;
+use crate::{complete, db};
 
 /// `ghostline suggest [--cwd DIR] [--limit N] [--all] <buffer>`
 /// Default prints only the ghost suffix (what comes after the typed buffer),
 /// so shells can render it dim. `--all` prints full candidate commands.
+/// History first (dir-aware frecency); when history misses and the buffer is
+/// a single command token, fall back to command-name completion (the pool
+/// behind Tab: PATH executables + builtins).
 pub fn run(args: &[String]) -> Result<(), String> {
     let mut cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
@@ -47,7 +50,13 @@ pub fn run(args: &[String]) -> Result<(), String> {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(db::default_db_path);
     let conn = db::open(&path).map_err(|e| format!("open db: {e}"))?;
-    let cands = db::suggest(&conn, &buffer, &cwd, limit).map_err(|e| format!("suggest: {e}"))?;
+    let mut cands = db::suggest(&conn, &buffer, &cwd, limit).map_err(|e| format!("suggest: {e}"))?;
+    if cands.is_empty() && !buffer.contains(char::is_whitespace) {
+        cands = complete::complete_command(&buffer)
+            .into_iter()
+            .take(limit.max(0) as usize)
+            .collect();
+    }
     if all {
         for c in cands {
             println!("{c}");

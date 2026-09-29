@@ -83,16 +83,39 @@ pub struct Entry {
 }
 
 pub fn insert(conn: &Connection, e: &Entry) -> rusqlite::Result<()> {
-    let id = uuid::Uuid::now_v7().to_string();
-    conn.execute(
-        "INSERT INTO history(id,cmd,cwd,exit_code,duration_ns,started_at,ended_at,hostname,session_id,shell,sensitive)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-        params![
-            id, e.cmd, e.cwd, e.exit_code, e.duration_ns, e.started_at, e.ended_at,
-            e.hostname, e.session_id, e.shell, if e.sensitive { 1 } else { 0 },
-        ],
-    )?;
-    Ok(())
+    insert_batch(conn, std::slice::from_ref(e)).map(|_| ())
+}
+
+/// Batch insert in a single transaction (daemon path: 500 rows / 1s).
+/// Returns number of rows inserted.
+pub fn insert_batch(conn: &Connection, entries: &[Entry]) -> rusqlite::Result<usize> {
+    if entries.is_empty() {
+        return Ok(0);
+    }
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO history(id,cmd,cwd,exit_code,duration_ns,started_at,ended_at,hostname,session_id,shell,sensitive)
+             VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        )?;
+        for e in entries {
+            stmt.execute(params![
+                uuid::Uuid::now_v7().to_string(),
+                e.cmd,
+                e.cwd,
+                e.exit_code,
+                e.duration_ns,
+                e.started_at,
+                e.ended_at,
+                e.hostname,
+                e.session_id,
+                e.shell,
+                if e.sensitive { 1 } else { 0 },
+            ])?;
+        }
+    }
+    tx.commit()?;
+    Ok(entries.len())
 }
 
 /// Frecency-ish search. FTS5 MATCH when query has non-wildcard tokens, else recent.

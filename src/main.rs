@@ -1,8 +1,10 @@
+mod cmd_daemon;
 mod cmd_init;
 mod cmd_log;
 mod cmd_search;
 mod cmd_suggest;
 mod db;
+mod queue;
 mod redact;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -12,15 +14,17 @@ fn usage() -> &'static str {
 
 Usage:
   ghostline init <bash|zsh|fish>      print shell hook (eval \"$(ghostline init bash)\")
-  ghostline log [flags] <command...>  log one command
+  ghostline log [flags] <command...>  log one command (or --queue for queue-append)
+  ghostline daemon [--once]           drain queue into SQLite (or run loop)
   ghostline search [flags] [query]    search history (tab-separated: ts, exit, cwd, cmd)
   ghostline suggest [flags] <buffer>  print ghost suffix for buffer (or --all for full cmds)
 
-log flags:     --shell S --cwd DIR --exit CODE --session ID [--db PATH]
+log flags:     --shell S --cwd DIR --exit CODE --session ID [--db PATH] [--queue] [--queue-dir D]
+daemon flags:  [--once] [--interval-ms N] [--queue-dir D] [--db PATH]
 search flags:  [--limit N] [--dir DIR] [--exit 0|!0] [--session S] [--host H] [--since UNIX] [--db PATH]
 suggest flags: [--cwd DIR] [--limit N] [--all] [--db PATH]
 
-Env: GHOSTLINE_IGNORE (glob list), GHOSTLINE_DISABLED=1 to pause logging."
+Env: GHOSTLINE_IGNORE (glob list), GHOSTLINE_DISABLED=1 to pause logging, GHOSTLINE_QUEUE=1 for queue-append."
 }
 
 fn main() {
@@ -52,6 +56,13 @@ fn main() {
             }
         },
         "search" => match cmd_search::run(rest) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("error: {e}");
+                1
+            }
+        },
+        "daemon" => match cmd_daemon::run(rest) {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("error: {e}");
@@ -134,6 +145,53 @@ mod integration {
         db::insert(&conn, &entry("deploy --prod", "/repo", 1, 100)).unwrap();
         let cands = db::suggest(&conn, "deploy", "/repo", 5).unwrap();
         assert!(cands.is_empty());
+    }
+
+    #[test]
+    fn batch_insert_is_single_txn() {
+        let conn = memdb();
+        let batch: Vec<db::Entry> = (0..500)
+            .map(|i| entry(&format!("cmd-{i}"), "/r", 0, 100 + i))
+            .collect();
+        let n = db::insert_batch(&conn, &batch).unwrap();
+        assert_eq!(n, 500);
+        let rows = db::search(&conn, "cmd-", 600, None, None, None, None, None).unwrap();
+        assert_eq!(rows.len(), 500);
+    }
+
+    #[test]
+    fn daemon_drain_moves_queue_to_db() {
+        let mut qdir = std::env::temp_dir();
+        qdir.push(format!("gl-drain-{}", std::process::id()));
+        let dbp = qdir.join("history.db");
+        std::fs::create_dir_all(&qdir).unwrap();
+        let e = entry("git push origin main", "/repo", 0, 999);
+        crate::queue::append(
+            &qdir,
+            &crate::queue::QueuedEntry {
+                cmd: e.cmd.clone(),
+                cwd: e.cwd.clone(),
+                exit_code: e.exit_code,
+                duration_ns: 0,
+                started_at: e.started_at,
+                ended_at: e.ended_at,
+                hostname: e.hostname.clone(),
+                session_id: e.session_id.clone(),
+                shell: e.shell.clone(),
+                sensitive: false,
+            },
+        )
+        .unwrap();
+        let (n, skipped) = crate::cmd_daemon::drain_once(&qdir, &dbp).unwrap();
+        assert_eq!((n, skipped), (1, 0));
+        let conn = db::open(&dbp).unwrap();
+        let rows = db::search(&conn, "push", 10, None, None, None, None, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].3, "git push origin main");
+        // second drain is a no-op
+        let (n2, _) = crate::cmd_daemon::drain_once(&qdir, &dbp).unwrap();
+        assert_eq!(n2, 0);
+        std::fs::remove_dir_all(&qdir).ok();
     }
 
     #[test]

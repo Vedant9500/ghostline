@@ -120,16 +120,14 @@ pub fn insert_batch(conn: &Connection, entries: &[Entry]) -> rusqlite::Result<us
 
 /// Frecency-ish search. FTS5 MATCH when query has non-wildcard tokens, else recent.
 /// Filters: cwd prefix, exit ("0" | "!0"), session, host, since (unix secs).
-pub fn search(
-    conn: &Connection,
+pub fn search_sql(
     query: &str,
-    limit: i64,
     dir: Option<&str>,
     exit_filter: Option<&str>,
     session: Option<&str>,
     host: Option<&str>,
     since: Option<i64>,
-) -> rusqlite::Result<Vec<(i64, i64, String, String)>> {
+) -> String {
     let exit_clause = match exit_filter {
         Some("0") => "AND h.exit_code = 0",
         Some("!0") => "AND h.exit_code != 0",
@@ -165,6 +163,20 @@ pub fn search(
         sql.push_str(" AND ?5 IS NULL");
     }
     sql.push_str(" ORDER BY h.started_at DESC LIMIT ?6");
+    sql
+}
+
+pub fn search(
+    conn: &Connection,
+    query: &str,
+    limit: i64,
+    dir: Option<&str>,
+    exit_filter: Option<&str>,
+    session: Option<&str>,
+    host: Option<&str>,
+    since: Option<i64>,
+) -> rusqlite::Result<Vec<(i64, i64, String, String)>> {
+    let sql = search_sql(query, dir, exit_filter, session, host, since);
     let mut stmt = conn.prepare(&sql)?;
     let q: Option<&str> = if query.is_empty() { None } else { Some(query) };
     let rows = stmt.query_map(params![q, dir, session, host, since, limit], |r| {
@@ -173,8 +185,38 @@ pub fn search(
     rows.collect()
 }
 
+/// Representative query plans for CI (`EXPLAIN QUERY PLAN` in gate output).
+/// Catches missing-index/schema regressions; shapes mirror search()/suggest().
+pub fn search_plan(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    let sql = search_sql("bench", None, None, None, None, None);
+    let full = format!("EXPLAIN QUERY PLAN {sql}");
+    let mut stmt = conn.prepare(&full)?;
+    let q: Option<&str> = Some("bench");
+    let none: Option<&str> = None;
+    let rows = stmt.query_map(params![q, none, none, none, None::<i64>, 20i64], |r| {
+        r.get::<_, String>(3)
+    })?;
+    rows.collect()
+}
+
+pub const SUGGEST_SQL: &str = "SELECT cmd,
+           (100 * MAX(CASE WHEN cwd = ?2 THEN 1 ELSE 0 END))
+           + 10 * SUM(CASE WHEN cwd = ?2 THEN 1 ELSE 0 END)
+           + 5 * COUNT(*)
+           AS w,
+           max(started_at) AS last_seen
+         FROM history h
+         WHERE cmd LIKE ?1 || '%' AND cmd != ?1 AND exit_code = 0
+         GROUP BY cmd
+         ORDER BY w DESC, last_seen DESC
+         LIMIT ?3";
+
 /// Ghost suggestion: prefix candidates ranked by dir-affinity + frequency + recency.
 /// Returns full commands (not suffixes); caller strips the typed prefix for ghost rendering.
+///
+/// Weight is computed in a single GROUP BY pass (no correlated subqueries:
+/// those made each keystroke O(groups × rows)). Only exit-0 runs count
+/// toward frequency — failed runs must not promote a suggestion.
 ///
 /// SAFETY: candidates containing control characters (ESC, newline, BEL, ...) are
 /// silently dropped. A ghost is painted raw onto the terminal every keystroke;
@@ -188,19 +230,7 @@ pub fn suggest(
 ) -> rusqlite::Result<Vec<String>> {
     // Weight: same-dir hit = 100, else 0; plus log(freq) and recency decay computed in SQL.
     // Over-fetch: control-tainted rows are filtered in Rust below.
-    let mut stmt = conn.prepare(
-        "SELECT cmd,
-           (100 * MAX(CASE WHEN cwd = ?2 THEN 1 ELSE 0 END))
-           + 10 * (SELECT count(*) FROM history h2 WHERE h2.cmd = h.cmd AND h2.cwd = ?2)
-           + 5 * (SELECT count(*) FROM history h2 WHERE h2.cmd = h.cmd)
-           AS w,
-           max(started_at) AS last_seen
-         FROM history h
-         WHERE cmd LIKE ?1 || '%' AND cmd != ?1 AND exit_code = 0
-         GROUP BY cmd
-         ORDER BY w DESC, last_seen DESC
-         LIMIT ?3",
-    )?;
+    let mut stmt = conn.prepare(SUGGEST_SQL)?;
     let rows = stmt.query_map(params![buffer, cwd, limit + 16], |r| r.get::<_, String>(0))?;
     Ok(rows
         .collect::<rusqlite::Result<Vec<_>>>()?
@@ -210,7 +240,25 @@ pub fn suggest(
         .collect())
 }
 
-/// Most recent distinct command starting with prefix (for tests / simple consumers).
+/// Representative suggest plan for CI gate output (shape mirrors suggest()).
+pub fn suggest_plan(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    let full = format!("EXPLAIN QUERY PLAN {SUGGEST_SQL}");
+    let mut stmt = conn.prepare(&full)?;
+    let rows = stmt.query_map(params!["bench", "/bench", 21i64], |r| {
+        r.get::<_, String>(3)
+    })?;
+    rows.collect()
+}
+
+/// Schema objects present (tables + indexes). Gate asserts the budgeted
+/// objects exist; plans above show how the queries use them.
+pub fn schema_objects(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT name FROM sqlite_master WHERE type IN ('table','index') ORDER BY name",
+    )?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    rows.collect()
+}
 #[allow(dead_code)]
 pub fn latest_with_prefix(conn: &Connection, prefix: &str) -> rusqlite::Result<Option<String>> {
     conn.query_row(

@@ -1,3 +1,4 @@
+mod cmd_bench;
 mod cmd_daemon;
 mod cmd_fix;
 mod cmd_import;
@@ -23,12 +24,15 @@ Usage:
   ghostline fix [--last] [command...]  did-you-mean repair (exit 0 = found)
   ghostline search [flags] [query]    search history (tab-separated: ts, exit, cwd, cmd)
   ghostline suggest [flags] <buffer>  print ghost suffix for buffer (or --all for full cmds)
+  ghostline bench [flags]             run perf budgets (see docs/08-performance-budgets.md)
 
 log flags:     --shell S --cwd DIR --exit CODE --session ID [--db PATH] [--queue] [--queue-dir D]
 daemon flags:  [--once] [--interval-ms N] [--queue-dir D] [--db PATH]
 fix flags:     [--last] [--exit CODE] [--cwd DIR] [--db P] [-q]
 search flags:  [--limit N] [--dir DIR] [--exit 0|!0] [--session S] [--host H] [--since UNIX] [--db PATH]
 suggest flags: [--cwd DIR] [--limit N] [--all] [--db PATH]
+bench flags:   [--n N] [--reps R] [--concurrency C] [--json] [--db PATH] [--gate]
+               [--max-log-ms X] [--max-search-ms X] [--max-suggest-ms X] [--max-hook-ms X] [--min-inserts-per-s X]
 
 Env: GHOSTLINE_IGNORE (glob list), GHOSTLINE_DISABLED=1 to pause logging, GHOSTLINE_QUEUE=1 for queue-append."
 }
@@ -90,6 +94,13 @@ fn main() {
             }
         },
         "suggest" => match cmd_suggest::run(rest) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("error: {e}");
+                1
+            }
+        },
+        "bench" => match cmd_bench::run_cli(rest) {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("error: {e}");

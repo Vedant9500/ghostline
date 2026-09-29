@@ -1,0 +1,51 @@
+# Perf gate for `08-performance-budgets.md` (roadmap item 6).
+#
+# PR/push `gate`: unit tests (incl. non-vacuous gate-enforcement tests) +
+# release `ghostline bench --gate` against doc budgets. Fails the run on
+# any budget violation. bench.json uploaded for dashboarding.
+#
+# `nightly-matrix`: weekly + manual; bigger seed on ubuntu/macos.
+# Deferred (not in v1 slice): hyperfine hook-overhead comparison,
+# expect/tmux E2E prompt harness, NFS/container matrix.
+name: perf
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "0 3 * * 0" # weekly Sunday 03:00 UTC
+  workflow_dispatch:
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test
+      - run: cargo build --release
+      - name: bench gate (doc budgets)
+        run: ./target/release/ghostline bench --n 10000 --reps 20 --json --gate | tee bench.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-ubuntu
+          path: bench.json
+
+  nightly-matrix:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - name: bench gate (larger seed)
+        run: ./target/release/ghostline bench --n 50000 --reps 20 --json --gate | tee bench-${{ matrix.os }}.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-nightly-${{ matrix.os }}
+          path: bench-${{ matrix.os }}.json

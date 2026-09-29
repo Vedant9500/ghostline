@@ -40,7 +40,7 @@ assert_eq "ghost-state-kept" "git checkout main" "$_GHOSTLINE_SUGGEST"
 
 # 1d. fast path: typing along the cache forks nothing
 READLINE_LINE="git ch"; READLINE_POINT=6
-_GHOSTLINE_SUGGEST=""; _GHOSTLINE_PAINTED=""; _GHOSTLINE_PAINTED_LINE=""
+_GHOSTLINE_SUGGEST=""; _GHOSTLINE_PAINTED=""; _GHOSTLINE_PAINTED_LINE=""; _GHOSTLINE_LAST_FORK=0
 : > "$calls_log"
 _ghostline_ghost >/dev/null
 assert_eq "fast-prime-calls" "1" "$(ncalls)"
@@ -55,14 +55,27 @@ assert_eq "fast-typed-c" "git chec" "$READLINE_LINE"
 assert_eq "fast-norefork2" "1" "$(ncalls)"
 # diverge -> fork again
 READLINE_LINE="git X"; READLINE_POINT=5
+_GHOSTLINE_LAST_FORK=0
 _ghostline_ghost >/dev/null
 assert_eq "diverge-reforks" "2" "$(ncalls)"
 assert_eq "diverge-cleared" "" "$_GHOSTLINE_SUGGEST"
 # token boundary (trailing space) -> re-rank fork even along cache
-_GHOSTLINE_SUGGEST="cargo test"; _GHOSTLINE_PAINTED=""; _GHOSTLINE_PAINTED_LINE=""
+_GHOSTLINE_SUGGEST="cargo test"; _GHOSTLINE_PAINTED=""; _GHOSTLINE_PAINTED_LINE=""; _GHOSTLINE_LAST_FORK=0
 READLINE_LINE="cargo "; READLINE_POINT=6
 _ghostline_ghost >/dev/null
 assert_eq "space-reforks" "3" "$(ncalls)"
+
+# 1e. slow-path forks throttled to ~10Hz during bursts (ble.sh parity)
+: > "$calls_log"
+now_ms=$(( ${EPOCHREALTIME/./} / 1000 ))
+_GHOSTLINE_LAST_FORK=$now_ms
+_GHOSTLINE_SUGGEST=""; _GHOSTLINE_PAINTED=""; _GHOSTLINE_PAINTED_LINE=""
+READLINE_LINE="zzz-diverge"; READLINE_POINT=11
+_ghostline_ghost >/dev/null
+assert_eq "throttle-skips" "0" "$(ncalls)"
+_GHOSTLINE_LAST_FORK=$(( now_ms - 500 ))
+_ghostline_ghost >/dev/null
+assert_eq "throttle-fires-after-pause" "1" "$(ncalls)"
 
 # 2. no history hit -> cleared + erase-to-EOL
 READLINE_LINE="zzz"; READLINE_POINT=3
@@ -105,6 +118,7 @@ assert_eq "dismiss" "" "$_GHOSTLINE_SUGGEST"
 
 # 8a. per-char insert fn types the char AND refreshes ghost
 READLINE_LINE="git c"; READLINE_POINT=5
+_GHOSTLINE_LAST_FORK=0
 _ghostline_k_104 >/dev/null
 assert_eq "keyfn-line" "git ch" "$READLINE_LINE"
 assert_eq "keyfn-refresh" "git checkout main" "$_GHOSTLINE_SUGGEST"

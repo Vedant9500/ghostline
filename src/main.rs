@@ -1,5 +1,6 @@
 mod cmd_daemon;
 mod cmd_fix;
+mod cmd_import;
 mod cmd_init;
 mod cmd_log;
 mod cmd_search;
@@ -18,6 +19,7 @@ Usage:
   ghostline init <bash|zsh|fish>      print shell hook (eval \"$(ghostline init bash)\")
   ghostline log [flags] <command...>  log one command (or --queue for queue-append)
   ghostline daemon [--once]           drain queue into SQLite (or run loop)
+  ghostline import [--from HISTFILE]  bulk-import shell history
   ghostline fix [--last] [command...]  did-you-mean repair (exit 0 = found)
   ghostline search [flags] [query]    search history (tab-separated: ts, exit, cwd, cmd)
   ghostline suggest [flags] <buffer>  print ghost suffix for buffer (or --all for full cmds)
@@ -67,6 +69,13 @@ fn main() {
             }
         },
         "daemon" => match cmd_daemon::run(rest) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("error: {e}");
+                1
+            }
+        },
+        "import" => match cmd_import::run(rest) {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("error: {e}");
@@ -203,6 +212,19 @@ mod integration {
         let (n2, _) = crate::cmd_daemon::drain_once(&qdir, &dbp).unwrap();
         assert_eq!(n2, 0);
         std::fs::remove_dir_all(&qdir).ok();
+    }
+
+    #[test]
+    fn suggest_skips_control_entries() {
+        // Ghost is painted raw onto the terminal: replaying ESC/newline/BEL
+        // entries would fire inverse video, cursor jumps, scrolls (flicker).
+        let conn = memdb();
+        db::insert(&conn, &entry("echo \x1b[7mBOLD", "/r", 0, 100)).unwrap();
+        db::insert(&conn, &entry("echo line1\nline2", "/r", 0, 101)).unwrap();
+        db::insert(&conn, &entry("echo beep\x07", "/r", 0, 102)).unwrap();
+        db::insert(&conn, &entry("echo clean", "/r", 0, 103)).unwrap();
+        let cands = db::suggest(&conn, "echo ", "/r", 5).unwrap();
+        assert_eq!(cands, vec!["echo clean"]);
     }
 
     #[test]

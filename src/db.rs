@@ -175,6 +175,11 @@ pub fn search(
 
 /// Ghost suggestion: prefix candidates ranked by dir-affinity + frequency + recency.
 /// Returns full commands (not suffixes); caller strips the typed prefix for ghost rendering.
+///
+/// SAFETY: candidates containing control characters (ESC, newline, BEL, ...) are
+/// silently dropped. A ghost is painted raw onto the terminal every keystroke;
+/// replaying an entry like `echo -e '\e[7m..'` would fire inverse video, cursor
+/// jumps and scrolls — i.e. whole-terminal flicker plus readline desync.
 pub fn suggest(
     conn: &Connection,
     buffer: &str,
@@ -182,6 +187,7 @@ pub fn suggest(
     limit: i64,
 ) -> rusqlite::Result<Vec<String>> {
     // Weight: same-dir hit = 100, else 0; plus log(freq) and recency decay computed in SQL.
+    // Over-fetch: control-tainted rows are filtered in Rust below.
     let mut stmt = conn.prepare(
         "SELECT cmd,
            (100 * MAX(CASE WHEN cwd = ?2 THEN 1 ELSE 0 END))
@@ -195,8 +201,13 @@ pub fn suggest(
          ORDER BY w DESC, last_seen DESC
          LIMIT ?3",
     )?;
-    let rows = stmt.query_map(params![buffer, cwd, limit], |r| r.get::<_, String>(0))?;
-    rows.collect()
+    let rows = stmt.query_map(params![buffer, cwd, limit + 16], |r| r.get::<_, String>(0))?;
+    Ok(rows
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|c| !c.chars().any(|ch| ch.is_control()))
+        .take(limit.max(0) as usize)
+        .collect())
 }
 
 /// Most recent distinct command starting with prefix (for tests / simple consumers).

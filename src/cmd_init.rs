@@ -65,7 +65,19 @@ if [ -z "${_GHOSTLINE_GHOST_INITED:-}" ] && [ "${GHOSTLINE_GHOST:-1}" != "0" ] &
        && [ "${line: -1}" != " " ]; then
       suf="${_GHOSTLINE_SUGGEST#$line}"
     else
-      # Slow path: erase stale ghost BEFORE the fork so no wrong text lingers.
+      # Slow path: throttle forks to ~10Hz during burst typing (ble.sh uses a
+      # 100ms idle delay for the same reason). A skipped fork keeps the old
+      # ghost briefly stale instead of flickering through fork latency.
+      # (fish does this with background threads; bash has no hook for that,
+      # so time-throttle is the closest equivalent.)
+      if [ -n "${EPOCHREALTIME:-}" ]; then
+        local now_ms=$(( ${EPOCHREALTIME/./} / 1000 ))
+        if [ $(( now_ms - ${_GHOSTLINE_LAST_FORK:-0} )) -lt 100 ]; then
+          return 0
+        fi
+        _GHOSTLINE_LAST_FORK=$now_ms
+      fi
+      # Erase stale ghost BEFORE the fork so no wrong text lingers.
       if [ -n "${_GHOSTLINE_PAINTED:-}" ]; then
         _GHOSTLINE_PAINTED=""; _GHOSTLINE_PAINTED_LINE=""
         printf '\e[K'

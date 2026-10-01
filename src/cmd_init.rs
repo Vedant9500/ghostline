@@ -48,7 +48,12 @@ if [ -z "${_GHOSTLINE_GHOST_INITED:-}" ] && [ "${GHOSTLINE_GHOST:-1}" != "0" ] &
   # (no extra full-line `bind -x` refresh, no flicker). Fallback below is
   # on-demand shell (Ctrl-G / Right) with native typing.
   _GHOSTLINE_SO="$(dirname "$(command -v ghostline 2>/dev/null)")/ghostline_autosuggest.so"
+  # Probe the .so in a SUBSHELL first: a stale/incompatible build can
+  # segfault on dlopen, and that must never take down the login shell
+  # (every new terminal would flash-close). A subshell crash fails the
+  # condition safely and falls back to on-demand shell ghost below.
   if [ -n "${_GHOSTLINE_SO:-}" ] && [ -f "$_GHOSTLINE_SO" ] \
+    && (enable -f "$_GHOSTLINE_SO" ghostline_autosuggest >/dev/null 2>&1) \
     && enable -f "$_GHOSTLINE_SO" ghostline_autosuggest 2>/dev/null \
     && ghostline_autosuggest enable 2>/dev/null; then
     _GHOSTLINE_NATIVE_AUTO=1
@@ -215,6 +220,7 @@ if [ -z "${_GHOSTLINE_GHOST_INITED:-}" ] && [ "${GHOSTLINE_GHOST:-1}" != "0" ] &
     bind -m "$map" -x '"\C-f": _ghostline_accept'
     bind -m "$map" -x '"\C-g": _ghostline_preview'
     bind -m "$map" -x '"\e\e[C": _ghostline_accept_word'
+    bind -m "$map" -x '"\ef": _ghostline_accept_word'
     bind -m "$map" -x '"\C-]": _ghostline_dismiss'
     bind -m "$map" -x '"\C-?": _ghostline_bspace'
     bind -m "$map" -x '"\C-h": _ghostline_bspace'
@@ -223,8 +229,15 @@ if [ -z "${_GHOSTLINE_GHOST_INITED:-}" ] && [ "${GHOSTLINE_GHOST:-1}" != "0" ] &
     bind -m "$map" -x '"\C-k": _ghostline_kill_end'
     bind -m "$map" -x '"\C-a": _ghostline_home'
     bind -m "$map" -x '"\C-e": _ghostline_end'
+    # NOTE: Tab (\C-i) is intentionally NOT bound here. A `bind -x` Tab
+    # override cannot delegate to readline's original `complete` when no
+    # ghost is showing, so hijacking it would break normal completion.
+    # The native hook (ghostline_autosuggest.so) owns Tab safely in C:
+    # accept-ghost-when-usable, else original completion (complete /
+    # menu-complete / custom). Fallback keeps Tab as `complete`; use
+    # Right / Ctrl-F to accept, Alt-Right / Alt-F for one word.
   }
-  # Native hook already owns accept/cursor keys; shell binds would override it.
+  # Native hook already owns accept/cursor keys + Tab/Alt-F; shell binds would override it.
   if [ -z "${_GHOSTLINE_NATIVE_AUTO:-}" ]; then
     if set -o 2>/dev/null | grep -q '^vi[[:space:]]*on'; then
       _ghostline_install_map emacs

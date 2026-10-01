@@ -2,6 +2,12 @@
 # ghostline install/update: builds release binary, installs it, and wires the
 # shell hook into every installed shell's rc file (covers all terminals —
 # terminals just run your shell). Idempotent: safe to re-run for updates.
+# Must be EXECUTED (./install.sh), not sourced: the `exit` calls below would
+# otherwise exit your interactive shell and the terminal closes.
+if [ "${BASH_SOURCE[0]:-}" != "${0}" ]; then
+  echo "error: run it, don't source it: ./install.sh (sourcing runs exit in your shell)" >&2
+  return 1 2>/dev/null || exit 1
+fi
 set -euo pipefail
 
 PREFIX="${GHOSTLINE_PREFIX:-$HOME/.local/bin}"
@@ -120,5 +126,5 @@ fi
 
 echo ""
 echo "Done. Open a new terminal (any of them — Alacritty, Kitty, etc.) and type a known command prefix."
-echo "Press Ctrl-G or Right-arrow at end of line to preview dim ghost; Right-arrow accepts, Alt-Right accepts a word, Ctrl-] dismisses."
+echo "Tab accepts the dim ghost when visible (else normal completion); Right-arrow / Ctrl-F accepts, Alt-Right / Alt-F accepts a word, Ctrl-] dismisses."
 echo "Typing stays native (no per-char refresh flicker). Disable ghost any time: export GHOSTLINE_GHOST=0. Pause logging: export GHOSTLINE_DISABLED=1."

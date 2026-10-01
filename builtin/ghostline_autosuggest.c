@@ -50,6 +50,9 @@ static rl_command_func_t *o_home1 = NULL;
 static rl_command_func_t *o_beg = NULL;
 static rl_command_func_t *o_back = NULL;
 static rl_command_func_t *o_paste = NULL;
+static rl_command_func_t *o_tab = NULL;
+static rl_command_func_t *o_altf = NULL;
+static int g_last_rows = -1, g_last_cols = -1;
 
 static void free_str(char **p) { if (p && *p) { free(*p); *p = NULL; } }
 
@@ -188,6 +191,37 @@ static void drop_painted(void) {
 }
 
 static void ghost_redisplay(void) {
+    /* SIGWINCH fix: readline's rl_resize_terminal() skips
+     * _rl_redisplay_after_sigwinch()'s clear when a custom
+     * rl_redisplay_function is installed (terminal.c: custom ->
+     * rl_forced_update_display() with no clear, vs default ->
+     * _rl_redisplay_after_sigwinch() which clears). Without the clear,
+     * orig draws at the stale cursor position, appending a second
+     * prompt instead of overwriting (observed as
+     * `[u@h ~]$ [u@h ~]$ ...` on every resize). Replicate the missing
+     * clear when the screen size changed. Must run even when ghost is
+     * disabled: the hook itself breaks the resize path, not the paint.
+     * NOTE: single-line clear only (covers empty prompt + typical
+     * single-line buffers, i.e. the reported bug). Multi-line prompts or
+     * wrapped buffers occupying >1 screen line can still leave fragments
+     * above, same as baseline readline custom-hook behavior; full
+     * multi-line would need saved _rl_vis_botlin/_rl_last_v_pos. */
+    {
+        int rows = 0, cols = 0;
+        int resized = 0;
+        rl_get_screen_size(&rows, &cols);
+        if (g_last_rows != -1 && (rows != g_last_rows || cols != g_last_cols))
+            resized = 1;
+        g_last_rows = rows;
+        g_last_cols = cols;
+        if (resized) {
+            rl_clear_visible_line();
+            /* Clear wiped the ghost too, but g_painted_* still thinks it is
+             * on screen -> fast path would skip repaint and leave the line
+             * ghostless until the next key. Drop to force repaint below. */
+            drop_painted();
+        }
+    }
     if (orig_redisplay) orig_redisplay();
     else rl_redisplay();
 
@@ -297,9 +331,34 @@ static int ghost_accept_word(int count, int key) {
             }
         }
     }
+    if (o_altf) return o_altf(1, key);
     rl_command_func_t *f = rl_named_function("forward-word");
     if (f) return f(1, key);
     return rl_forward_char(1, key);
+}
+
+/* Tab: accept ghost when usable, else original completion.
+ * Without this, typing `ope` with ghost `ncode` + Tab runs readline's
+ * `complete`, which completes to the longest common prefix (`open`) across
+ * PATH matches and discards the ghost. With the wrapper, first Tab takes
+ * the ghost; Tab with no ghost preserves the user's completion binding
+ * (complete / menu-complete / custom). */
+static int ghost_tab(int count, int key) {
+    if (rl_line_buffer && rl_point == rl_end && g_cached_full) {
+        size_t blen = strlen(rl_line_buffer);
+        if (blen > 0 && strncmp(g_cached_full, rl_line_buffer, blen) == 0
+            && strlen(g_cached_full) > blen) {
+            const char *suf = g_cached_full + blen;
+            if (*suf && !has_control(suf)) {
+                rl_insert_text(suf);
+                return 0;
+            }
+        }
+    }
+    if (o_tab) return o_tab(count, key);
+    rl_command_func_t *f = rl_named_function("complete");
+    if (f) return f(count, key);
+    return 0;
 }
 
 static int ghost_clear(int count, int key) {
@@ -386,6 +445,7 @@ static int do_enable(void) {
     rl_redisplay_function = ghost_redisplay;
     rl_add_funmap_entry("ghostline-accept", ghost_accept);
     rl_add_funmap_entry("ghostline-accept-word", ghost_accept_word);
+    rl_add_funmap_entry("ghostline-accept-tab", ghost_tab);
     rl_add_funmap_entry("ghostline-clear", ghost_clear);
     rl_add_funmap_entry("ghostline-end", ghost_end);
     rl_add_funmap_entry("ghostline-newline", ghost_newline);
@@ -396,6 +456,8 @@ static int do_enable(void) {
     bind_both("\\e\\e[C", ghost_accept_word);
     bind_both("\\C-]", ghost_clear);
     /* clear-widgets parity: save orig before overriding */
+    bind_wrap_both("\\C-i", ghost_tab, &o_tab);
+    bind_wrap_both("\\ef", ghost_accept_word, &o_altf);
     bind_wrap_both("\\C-m", ghost_newline, &o_accept_m);
     bind_wrap_both("\\C-j", ghost_newline, &o_accept_j);
     bind_wrap_both("\\e[D", ghost_left, &o_left);
@@ -408,6 +470,14 @@ static int do_enable(void) {
         if (pb) { o_paste = pb; bind_both("\\e[200~", ghost_paste); }
     }
     resolve_bin();
+    /* Init size tracking so first redisplay after enable doesn't
+     * false-trigger the SIGWINCH clear. */
+    {
+        int rows = 0, cols = 0;
+        rl_get_screen_size(&rows, &cols);
+        g_last_rows = rows;
+        g_last_cols = cols;
+    }
     g_enabled = 1;
     return 0;
 }
@@ -417,6 +487,8 @@ static int do_disable(void) {
     if (orig_redisplay) rl_redisplay_function = orig_redisplay;
     free_str(&g_cached_full);
     drop_painted();
+    g_last_rows = -1;
+    g_last_cols = -1;
     return 0;
 }
 
@@ -436,7 +508,7 @@ int ghostline_autosuggest_unload(void) {
     do_disable();
     orig_redisplay = NULL;
     o_accept_m = o_accept_j = o_left = o_home = o_home1 = NULL;
-    o_beg = o_back = o_paste = NULL;
+    o_beg = o_back = o_paste = o_tab = o_altf = NULL;
     return 0;
 }
 

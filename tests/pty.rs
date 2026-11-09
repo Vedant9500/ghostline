@@ -122,3 +122,75 @@ fn bash_ghost_pty_auto() {
     );
     std::fs::remove_dir_all(&workdir).ok();
 }
+
+/// Native auto-ghost must never paint past the right margin: at a narrow
+/// width the ghost is truncated to the space left on the last screen row
+/// so long lines keep wrapping natively instead of rendering truncated.
+#[test]
+fn bash_ghost_pty_wrap() {
+    let Some(py) = python() else {
+        eprintln!("SKIP bash_ghost_pty_wrap: no python3");
+        return;
+    };
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let mut workdir = std::env::temp_dir();
+    workdir.push(format!("gl-pty-wrap-{}", std::process::id()));
+    std::fs::create_dir_all(&workdir).unwrap();
+    let install = workdir.join("install");
+    std::fs::create_dir_all(&install).unwrap();
+    let so = install.join("ghostline_autosuggest.so");
+    let cc = std::process::Command::new("cc")
+        .args([
+            "-shared",
+            "-fPIC",
+            "-o",
+            so.to_str().unwrap(),
+            &format!("{manifest}/builtin/ghostline_autosuggest.c"),
+            "-I/usr/include/bash",
+            "-I/usr/include/bash/include",
+        ])
+        .output();
+    let Ok(cc_out) = cc else {
+        eprintln!("SKIP bash_ghost_pty_wrap: no cc");
+        std::fs::remove_dir_all(&workdir).ok();
+        return;
+    };
+    if !cc_out.status.success() || !so.exists() {
+        eprintln!(
+            "SKIP bash_ghost_pty_wrap: cc failed: {}",
+            String::from_utf8_lossy(&cc_out.stderr)
+        );
+        std::fs::remove_dir_all(&workdir).ok();
+        return;
+    }
+    let bin = env!("CARGO_BIN_EXE_ghostline");
+    // Fake user install: binary + .so side by side, snippet resolves it.
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(bin, install.join("ghostline")).unwrap();
+    #[cfg(not(unix))]
+    std::fs::copy(bin, install.join("ghostline")).unwrap();
+    let install_s = install.to_string_lossy().into_owned();
+    let init = std::process::Command::new(bin)
+        .arg("init")
+        .arg("bash")
+        .env("PATH", format!("{install_s}:{}", std::env::var("PATH").unwrap_or_default()))
+        .output()
+        .expect("init bash");
+    assert!(init.status.success());
+    let snip = workdir.join("snip.bash");
+    std::fs::write(&snip, &init.stdout).unwrap();
+
+    let script = format!("{manifest}/tests/ghost_pty_wrap.py");
+    let out = std::process::Command::new(py)
+        .arg(&script)
+        .arg(&snip)
+        .arg(&install)
+        .arg(&workdir)
+        .output()
+        .expect("run ghost_pty_wrap.py");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "ghost_pty_wrap.py failed:\n{stdout}\n{stderr}");
+    assert!(stdout.contains("RESULT: OK"), "unexpected output:\n{stdout}");
+    std::fs::remove_dir_all(&workdir).ok();
+}

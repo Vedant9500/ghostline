@@ -109,6 +109,44 @@ if [ -z "${_GHOSTLINE_GHOST_INITED:-}" ] && [ "${GHOSTLINE_GHOST:-1}" != "0" ] &
       _GHOSTLINE_SUGGEST=""
       return 0
     fi
+    # Width guard: never paint past the right margin. Readline doesn't know
+    # about the ghost, so a wrapped ghost desyncs redisplay (long lines look
+    # truncated instead of wrapping natively). Truncate to the space left on
+    # the last screen row; no room -> skip the paint but keep the cached
+    # candidate (a shorter line may fit again).
+    {
+      local cols="${COLUMNS:-80}"
+      [[ "$cols" =~ ^[0-9]+$ ]] && [ "$cols" -gt 0 ] || cols=80
+      local plen="${GHOSTLINE_PROMPT_LEN:-}"
+      if [ -z "$plen" ]; then
+        # Best-effort visible prompt length: strip \[...\] non-printing
+        # spans, keep the last line (multiline prompts). Unexpanded `\u`
+        # etc. are approximate; set GHOSTLINE_PROMPT_LEN to exact cols
+        # for exotic prompts.
+        local _pp="${PS1:-}" _pv="" _pinvis=0 _pi=0 _pc
+        while [ "$_pi" -lt "${#_pp}" ]; do
+          _pc="${_pp:$_pi:2}"
+          if [ "$_pc" = '\[' ]; then _pinvis=1; _pi=$((_pi + 2)); continue
+          elif [ "$_pc" = '\]' ]; then _pinvis=0; _pi=$((_pi + 2)); continue
+          fi
+          [ "$_pinvis" -eq 0 ] && _pv="${_pv}${_pp:$_pi:1}"
+          _pi=$((_pi + 1))
+        done
+        _pv="${_pv##*$'\n'}"
+        plen="${#_pv}"
+      fi
+      local _used=$(( plen + ${#line} ))
+      local _r=$(( _used % cols ))
+      if [ "$_r" -eq 0 ]; then
+        _GHOSTLINE_PAINTED=""; _GHOSTLINE_PAINTED_LINE=""
+        return 0
+      fi
+      local _avail=$(( cols - _r ))
+      if [ "${#suf}" -gt "$_avail" ]; then
+        suf="${suf:0:$_avail}"
+      fi
+      [ -z "$suf" ] && { _GHOSTLINE_PAINTED=""; _GHOSTLINE_PAINTED_LINE=""; return 0; }
+    }
     if [ "$suf" = "${_GHOSTLINE_PAINTED:-}" ] && [ "$line" = "${_GHOSTLINE_PAINTED_LINE:-}" ]; then
       return 0  # already on screen; repainting would flicker
     fi

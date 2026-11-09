@@ -15,6 +15,7 @@
  * Load:  enable -f ./ghostline_autosuggest.so ghostline_autosuggest
  *        ghostline_autosuggest enable
  */
+#define _GNU_SOURCE 1 /* wcwidth + bash headers' unlocked-io need GNU/XOPEN */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,6 +29,7 @@
 
 #include <readline/readline.h>
 #include <readline/keymaps.h>
+#include <wchar.h>
 
 #include "builtins.h"
 #include "shell.h"
@@ -62,6 +64,129 @@ static int has_control(const char *s) {
         if (c < 0x20 || c == 0x7f) return 1;
     }
     return 0;
+}
+
+/* Display columns of the first n bytes of s, matching readline's layout
+ * closely enough to never under-count (under-counting lets the ghost wrap
+ * past the right margin onto a row readline doesn't track, desyncing the
+ * next redisplay so long lines render garbled/truncated instead of
+ * wrapping). Tab -> next 8-col stop, C0 controls/DEL -> 2 (^X), other
+ * bytes -> wcwidth via mbrtowc ( undecodable bytes -> 1, same as
+ * readline's multibyte fallback). start_col anchors tab stops. */
+static int text_cols(const char *s, size_t n, int start_col) {
+    mbstate_t ps;
+    memset(&ps, 0, sizeof(ps));
+    int col = start_col;
+    size_t i = 0;
+    while (i < n) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '\t') {
+            col += 8 - (col % 8);
+            i++;
+            memset(&ps, 0, sizeof(ps));
+            continue;
+        }
+        if (c < 0x20 || c == 0x7f) {
+            col += 2;
+            i++;
+            memset(&ps, 0, sizeof(ps));
+            continue;
+        }
+        if (c < 0x80) {
+            col += 1;
+            i++;
+            memset(&ps, 0, sizeof(ps));
+            continue;
+        }
+        {
+            wchar_t wc;
+            size_t k = mbrtowc(&wc, s + i, n - i, &ps);
+            if (k == (size_t)-1 || k == (size_t)-2 || k == 0) {
+                col += 1;
+                i++;
+                memset(&ps, 0, sizeof(ps));
+                continue;
+            }
+            int w = wcwidth(wc);
+            col += (w < 0) ? 1 : w;
+            i += k;
+        }
+    }
+    return col - start_col;
+}
+
+/* Visible columns of the last visual line of the prompt shown by readline
+ * (rl_display_prompt when set, else rl_prompt). Strips \001..\002
+ * non-printing spans; \n resets (only the last line shares a row with the
+ * buffer). Byte-safe: \001\002\n\t are ASCII, never UTF-8 continuations. */
+static int prompt_cols(void) {
+    const char *p = rl_display_prompt ? rl_display_prompt
+                                      : (rl_prompt ? rl_prompt : "");
+    const char *last = p;
+    for (const char *q = p; *q; q++)
+        if (*q == '\n') last = q + 1;
+    char tmp[4096];
+    size_t ti = 0;
+    int invis = 0;
+    for (const char *q = last; *q && ti + 1 < sizeof(tmp); q++) {
+        if (*q == '\001') { invis = 1; continue; }
+        if (*q == '\002') { invis = 0; continue; }
+        if (invis) continue;
+        tmp[ti++] = *q;
+    }
+    tmp[ti] = '\0';
+    return text_cols(tmp, ti, 0);
+}
+
+/* Byte length of the longest prefix of suf fitting in maxcols columns.
+ * Never splits a multibyte char. Returns 0 when maxcols <= 0. Suffixes
+ * with control bytes are rejected before paint, so the control branches
+ * below are defensive only. */
+static size_t trunc_bytes(const char *suf, int maxcols) {
+    if (maxcols <= 0) return 0;
+    size_t total = strlen(suf);
+    mbstate_t ps;
+    memset(&ps, 0, sizeof(ps));
+    int col = 0;
+    size_t i = 0;
+    while (i < total) {
+        unsigned char c = (unsigned char)suf[i];
+        int w;
+        size_t k = 1;
+        if (c == '\t') {
+            w = 8 - (col % 8);
+        } else if (c < 0x20 || c == 0x7f) {
+            w = 2;
+        } else if (c < 0x80) {
+            w = 1;
+        } else {
+            wchar_t wc;
+            k = mbrtowc(&wc, suf + i, total - i, &ps);
+            if (k == (size_t)-1 || k == (size_t)-2 || k == 0) {
+                w = 1;
+                k = 1;
+                memset(&ps, 0, sizeof(ps));
+            } else {
+                w = wcwidth(wc);
+                if (w < 0) w = 1;
+            }
+        }
+        if (col + w > maxcols) break;
+        col += w;
+        i += k;
+    }
+    return i;
+}
+
+/* Room left on the last screen row for ghost text. 0 means suppress the
+ * paint: anything written now would wrap onto a row readline doesn't
+ * track, and the real line must keep wrapping natively. */
+static int ghost_avail_cols(const char *buf, size_t blen, int cols) {
+    if (cols <= 0) cols = 80;
+    long used = (long)prompt_cols() + (long)text_cols(buf, blen, 0);
+    long r = used % cols;
+    if (r == 0) return 0; /* cursor at the margin edge: any paint wraps */
+    return (int)(cols - r);
 }
 
 /* Validated SGR params only (digits + ';', <=32 chars). Default dim gray. */
@@ -163,6 +288,11 @@ static char *current_cwd(void) {
 
 static void out_write(const char *s) {
     FILE *out = rl_outstream ? rl_outstream : stdout;
+    /* Flush readline's buffered output first: orig_redisplay flushes, but
+     * key-handler paints run outside redisplay where stdio may hold
+     * pending bytes. Raw write() would jump ahead of them and corrupt
+     * the redraw order. */
+    fflush(out);
     int fd = fileno(out);
     if (fd < 0) return;
     size_t n = strlen(s);
@@ -173,11 +303,27 @@ static void out_write(const char *s) {
     }
 }
 
-static void paint_suffix(const char *suf) {
+static void out_write_n(const char *s, size_t n) {
+    FILE *out = rl_outstream ? rl_outstream : stdout;
+    fflush(out);
+    int fd = fileno(out);
+    if (fd < 0) return;
+    while (n > 0) {
+        ssize_t w = write(fd, s, n);
+        if (w <= 0) break;
+        s += w; n -= (size_t)w;
+    }
+}
+
+/* Length-bounded paint: draws exactly n bytes (a width-truncated prefix).
+ * suf must hold at least n bytes. The ghost is clipped to the space left
+ * on the last screen row and never wraps onto a row readline doesn't
+ * track; the real line keeps wrapping natively. */
+static void paint_suffix_n(const char *suf, size_t n) {
     out_write("\033[s\033[K\033[");
     out_write(ghost_style());
     out_write("m");
-    out_write(suf);
+    out_write_n(suf, n);
     out_write("\033[m\033[u");
 }
 
@@ -261,13 +407,26 @@ static void ghost_redisplay(void) {
             drop_painted();
             return;
         }
+        /* Width guard: truncate to the space left on the last screen row
+         * so the ghost never wraps onto a row readline doesn't track
+         * (that desync corrupts wrapped long lines). 0 room: suppress
+         * the paint but keep the cache (backspace may free columns). */
+        int avail = ghost_avail_cols(buf, blen,
+                                     g_last_cols > 0 ? g_last_cols : 80);
+        size_t tl = trunc_bytes(suf, avail);
+        if (tl == 0) {
+            if (g_painted_suf) clear_tail();
+            drop_painted();
+            return;
+        }
         if (g_painted_suf && g_painted_line
-            && strcmp(suf, g_painted_suf) == 0 && strcmp(buf, g_painted_line) == 0)
+            && strlen(g_painted_suf) == tl && memcmp(g_painted_suf, suf, tl) == 0
+            && strcmp(buf, g_painted_line) == 0)
             return;
         free_str(&g_painted_suf); free_str(&g_painted_line);
-        g_painted_suf = strdup(suf);
+        g_painted_suf = strndup(suf, tl);
         g_painted_line = strdup(buf);
-        paint_suffix(suf);
+        paint_suffix_n(suf, tl);
         return;
     }
     /* slow path: fork on every diverge. Fast path above already skips forks
@@ -286,15 +445,28 @@ static void ghost_redisplay(void) {
         memcpy(g_cached_full, buf, blen);
         strcpy(g_cached_full + blen, suf);
     }
-    if (g_painted_suf && g_painted_line
-        && strcmp(suf, g_painted_suf) == 0 && strcmp(buf, g_painted_line) == 0) {
+    {
+        int avail = ghost_avail_cols(buf, blen,
+                                     g_last_cols > 0 ? g_last_cols : 80);
+        size_t tl = trunc_bytes(suf, avail);
+        if (tl == 0) {
+            free(suf);
+            if (g_painted_suf) clear_tail();
+            drop_painted();
+            return;
+        }
+        if (g_painted_suf && g_painted_line
+            && strlen(g_painted_suf) == tl && memcmp(g_painted_suf, suf, tl) == 0
+            && strcmp(buf, g_painted_line) == 0) {
+            free(suf);
+            return;
+        }
+        free_str(&g_painted_suf); free_str(&g_painted_line);
+        g_painted_suf = strndup(suf, tl);
+        g_painted_line = strdup(buf);
+        paint_suffix_n(suf, tl);
         free(suf);
-        return;
     }
-    free_str(&g_painted_suf); free_str(&g_painted_line);
-    g_painted_suf = suf;
-    g_painted_line = strdup(buf);
-    paint_suffix(suf);
 }
 
 /* Right / Ctrl-F: accept at EOL when usable, else forward-char. */

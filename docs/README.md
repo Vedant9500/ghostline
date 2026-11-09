@@ -24,5 +24,4 @@ GHOSTLINE is a single static binary + 3-line shell hook (`bash`/`zsh`/`fish`) th
 
 ## Status
 
-Pre-implementation research. No code yet. These docs are the spec to build from.
-See [09-roadmap](09-roadmap.md) for the lean v1 slice.
+v0.1 is implemented: Rust CLI + SQLite WAL history, bash/zsh/fish logging hooks, bash ghost suggestions, typo repair, search, and the benchmark gate. Later design items remain in the roadmap. See the root [README](../README.md) for current usage and [09-roadmap](09-roadmap.md) for planned slices.

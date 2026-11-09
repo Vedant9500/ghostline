@@ -54,6 +54,9 @@ CREATE INDEX idx_time ON history(started_at DESC);
 CREATE INDEX idx_cwd ON history(cwd, started_at DESC);
 CREATE INDEX idx_session ON history(session_id, started_at);
 CREATE INDEX idx_host_session ON history(hostname, session_id);
+-- Covering partial index for per-keystroke ghost suggestions.
+CREATE INDEX idx_cmd ON history(cmd COLLATE NOCASE, cwd, started_at DESC)
+  WHERE exit_code = 0 AND sensitive = 0;
 
 CREATE VIRTUAL TABLE history_fts USING fts5(cmd, cwd, tokenize='trigram');
 

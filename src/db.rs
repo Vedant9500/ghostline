@@ -1,4 +1,4 @@
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, params};
 use std::path::PathBuf;
 
 /// Default DB path: $XDG_DATA_HOME/ghostline/history.db or ~/.local/share/ghostline/history.db
@@ -44,6 +44,10 @@ CREATE TABLE IF NOT EXISTS history(
 CREATE INDEX IF NOT EXISTS idx_time ON history(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_cwd ON history(cwd, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_session ON history(session_id, started_at);
+-- Covering partial index for the per-keystroke prefix query in suggest():
+-- successful, non-sensitive rows only; cmd/cwd/started_at read from the index.
+CREATE INDEX IF NOT EXISTS idx_cmd ON history(cmd COLLATE NOCASE, cwd, started_at DESC)
+  WHERE exit_code = 0 AND sensitive = 0;
 CREATE VIRTUAL TABLE IF NOT EXISTS history_fts USING fts5(cmd, cwd, tokenize='trigram');
 CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
   INSERT INTO history_fts(rowid, cmd, cwd) VALUES (new.rowid, new.cmd, new.cwd);
@@ -118,8 +122,45 @@ pub fn insert_batch(conn: &Connection, entries: &[Entry]) -> rusqlite::Result<us
     Ok(entries.len())
 }
 
-/// Frecency-ish search. FTS5 MATCH when query has non-wildcard tokens, else recent.
-/// Filters: cwd prefix, exit ("0" | "!0"), session, host, since (unix secs).
+/// Trigram FTS5 needs at least one three-character run; shorter queries use LIKE.
+const FTS_MIN_CHARS: usize = 3;
+
+fn use_fts(query: &str) -> bool {
+    query.chars().count() >= FTS_MIN_CHARS && !query.trim().is_empty()
+}
+
+/// Render a user query as an FTS5 string phrase, so MATCH operators and
+/// punctuation (`-`, `*`, `%`, ...) are searched literally instead of parsed
+/// as query syntax. Embedded double quotes are escaped by doubling.
+fn fts_phrase(query: &str) -> String {
+    let mut out = String::with_capacity(query.len() + 2);
+    out.push('"');
+    for c in query.chars() {
+        if c == '"' {
+            out.push('"');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
+/// Escape LIKE wildcards so a typed `%`/`_`/`\` stays literal under ESCAPE '\'.
+fn escape_like(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Frecency-ish search. FTS5 trigram phrase when the query is matchable,
+/// LIKE fallback for 1-2 character queries (trigrams cannot match those).
+/// Filters: cwd, exit ("0" | "!0"), session, host, since (unix nanoseconds;
+/// `cmd_search` converts user-facing seconds).
 pub fn search_sql(
     query: &str,
     dir: Option<&str>,
@@ -133,11 +174,20 @@ pub fn search_sql(
         Some("!0") => "AND h.exit_code != 0",
         _ => "",
     };
-    let mut sql =
-        String::from("SELECT h.started_at, h.exit_code, h.cwd, h.cmd FROM history h WHERE 1=1 ");
-    if !query.is_empty() {
-        // FTS path: join on history_fts when query looks matchable; fallback LIKE.
-        sql.push_str("AND (h.cmd LIKE '%' || ?1 || '%' OR h.cwd LIKE '%' || ?1 || '%') ");
+    let fts = use_fts(query);
+    let mut sql = String::from("SELECT h.started_at, h.exit_code, h.cwd, h.cmd FROM history h ");
+    if fts {
+        sql.push_str("JOIN history_fts ON history_fts.rowid = h.rowid ");
+    }
+    sql.push_str("WHERE 1=1 ");
+    if fts {
+        sql.push_str("AND history_fts MATCH ?1 ");
+    } else if !query.is_empty() {
+        // Short query: trigram FTS cannot match it, scan with LIKE instead.
+        sql.push_str(
+            "AND (h.cmd LIKE '%' || ?1 || '%' ESCAPE '\\' \
+             OR h.cwd LIKE '%' || ?1 || '%' ESCAPE '\\') ",
+        );
     } else {
         sql.push_str("AND ?1 IS NULL ");
     }
@@ -178,10 +228,17 @@ pub fn search(
 ) -> rusqlite::Result<Vec<(i64, i64, String, String)>> {
     let sql = search_sql(query, dir, exit_filter, session, host, since);
     let mut stmt = conn.prepare(&sql)?;
-    let q: Option<&str> = if query.is_empty() { None } else { Some(query) };
-    let rows = stmt.query_map(params![q, dir, session, host, since, limit], |r| {
-        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-    })?;
+    let bind_q: Option<String> = if use_fts(query) {
+        Some(fts_phrase(query))
+    } else if query.is_empty() {
+        None
+    } else {
+        Some(escape_like(query))
+    };
+    let rows = stmt.query_map(
+        params![bind_q.as_deref(), dir, session, host, since, limit],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    )?;
     rows.collect()
 }
 
@@ -191,11 +248,12 @@ pub fn search_plan(conn: &Connection) -> rusqlite::Result<Vec<String>> {
     let sql = search_sql("bench", None, None, None, None, None);
     let full = format!("EXPLAIN QUERY PLAN {sql}");
     let mut stmt = conn.prepare(&full)?;
-    let q: Option<&str> = Some("bench");
+    let bind_q = fts_phrase("bench");
     let none: Option<&str> = None;
-    let rows = stmt.query_map(params![q, none, none, none, None::<i64>, 20i64], |r| {
-        r.get::<_, String>(3)
-    })?;
+    let rows = stmt.query_map(
+        params![Some(bind_q.as_str()), none, none, none, None::<i64>, 20i64],
+        |r| r.get::<_, String>(3),
+    )?;
     rows.collect()
 }
 
@@ -206,8 +264,9 @@ pub const SUGGEST_SQL: &str = "SELECT cmd,
            AS w,
            max(started_at) AS last_seen
          FROM history h
-         WHERE cmd LIKE ?1 || '%' AND cmd != ?1 AND exit_code = 0
-         GROUP BY cmd
+         WHERE cmd LIKE ?1 ESCAPE '\\' AND cmd != ?4
+           AND exit_code = 0 AND sensitive = 0
+         GROUP BY cmd COLLATE NOCASE
          ORDER BY w DESC, last_seen DESC
          LIMIT ?3";
 
@@ -228,15 +287,20 @@ pub fn suggest(
     cwd: &str,
     limit: i64,
 ) -> rusqlite::Result<Vec<String>> {
-    // Weight: same-dir hit = 100, else 0; plus log(freq) and recency decay computed in SQL.
+    // Weight: same-dir hits dominate, frequency follows, recency breaks ties.
     // Over-fetch: control-tainted rows are filtered in Rust below.
+    let limit = limit.clamp(0, 1000);
+    let pattern = format!("{}%", escape_like(buffer));
     let mut stmt = conn.prepare(SUGGEST_SQL)?;
-    let rows = stmt.query_map(params![buffer, cwd, limit + 16], |r| r.get::<_, String>(0))?;
+    let rows = stmt.query_map(
+        params![pattern, cwd, limit.saturating_add(16), buffer],
+        |r| r.get::<_, String>(0),
+    )?;
     Ok(rows
         .collect::<rusqlite::Result<Vec<_>>>()?
         .into_iter()
         .filter(|c| !c.chars().any(|ch| ch.is_control()))
-        .take(limit.max(0) as usize)
+        .take(limit as usize)
         .collect())
 }
 
@@ -244,7 +308,8 @@ pub fn suggest(
 pub fn suggest_plan(conn: &Connection) -> rusqlite::Result<Vec<String>> {
     let full = format!("EXPLAIN QUERY PLAN {SUGGEST_SQL}");
     let mut stmt = conn.prepare(&full)?;
-    let rows = stmt.query_map(params!["bench", "/bench", 21i64], |r| {
+    let pattern = format!("{}%", escape_like("bench"));
+    let rows = stmt.query_map(params![pattern, "/bench", 21i64, "bench"], |r| {
         r.get::<_, String>(3)
     })?;
     rows.collect()
@@ -258,13 +323,4 @@ pub fn schema_objects(conn: &Connection) -> rusqlite::Result<Vec<String>> {
     )?;
     let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
     rows.collect()
-}
-#[allow(dead_code)]
-pub fn latest_with_prefix(conn: &Connection, prefix: &str) -> rusqlite::Result<Option<String>> {
-    conn.query_row(
-        "SELECT cmd FROM history WHERE cmd LIKE ?1 || '%' ORDER BY started_at DESC LIMIT 1",
-        params![prefix],
-        |r| r.get(0),
-    )
-    .optional()
 }

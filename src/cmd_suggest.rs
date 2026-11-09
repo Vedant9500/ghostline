@@ -1,5 +1,22 @@
 use crate::{complete, db};
 
+/// Suffix to paint for `cand` when `buffer` is its prefix, or None when the
+/// candidate is not a prefix or would produce an empty ghost. SQLite's LIKE is
+/// ASCII case-insensitive while `strip_prefix` is exact, so compare the head
+/// case-insensitively and slice by buffer byte length. `get` keeps multibyte
+/// boundaries safe.
+fn ghost_suffix<'a>(cand: &'a str, buffer: &str) -> Option<&'a str> {
+    if cand.len() <= buffer.len() {
+        return None;
+    }
+    let head = cand.get(..buffer.len())?;
+    if head.eq_ignore_ascii_case(buffer) {
+        Some(&cand[buffer.len()..])
+    } else {
+        None
+    }
+}
+
 /// `ghostline suggest [--cwd DIR] [--limit N] [--all] <buffer>`
 /// Default prints only the ghost suffix (what comes after the typed buffer),
 /// so shells can render it dim. `--all` prints full candidate commands.
@@ -58,15 +75,45 @@ pub fn run(args: &[String]) -> Result<(), String> {
             .collect();
     }
     if all {
-        for c in cands {
+        for c in &cands {
             println!("{c}");
         }
-    } else if let Some(first) = cands.into_iter().next() {
-        if let Some(suffix) = first.strip_prefix(&buffer) {
-            print!("{suffix}");
-            use std::io::Write;
-            std::io::stdout().flush().ok();
-        }
+    } else if let Some(suffix) = cands.iter().find_map(|c| ghost_suffix(c, &buffer)) {
+        print!("{suffix}");
+        use std::io::Write;
+        std::io::stdout().flush().ok();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ghost_suffix;
+
+    #[test]
+    fn exact_case_prefix() {
+        assert_eq!(ghost_suffix("git stash", "git"), Some(" stash"));
+    }
+
+    #[test]
+    fn case_insensitive_prefix() {
+        assert_eq!(ghost_suffix("Git status", "git"), Some(" status"));
+    }
+
+    #[test]
+    fn full_match_has_no_suffix() {
+        assert_eq!(ghost_suffix("git", "git"), None);
+        assert_eq!(ghost_suffix("Git status", "git status"), None);
+    }
+
+    #[test]
+    fn non_prefix_is_rejected() {
+        assert_eq!(ghost_suffix("cargo test", "git"), None);
+    }
+
+    #[test]
+    fn multibyte_boundaries_are_safe() {
+        assert_eq!(ghost_suffix("éclair", "e"), None);
+        assert_eq!(ghost_suffix("éclair", "é"), Some("clair"));
+    }
 }

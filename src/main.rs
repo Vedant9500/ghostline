@@ -30,7 +30,7 @@ Usage:
 log flags:     --shell S --cwd DIR --exit CODE --session ID [--db PATH] [--queue] [--queue-dir D]
 daemon flags:  [--once] [--interval-ms N] [--queue-dir D] [--db PATH]
 fix flags:     [--last] [--exit CODE] [--cwd DIR] [--db P] [-q]
-search flags:  [--limit N] [--dir DIR] [--exit 0|!0] [--session S] [--host H] [--since UNIX] [--db PATH]
+search flags:  [--limit N] [--dir DIR] [--exit 0|!0] [--session S] [--host H] [--since UNIX_SECS] [--db PATH]
 suggest flags: [--cwd DIR] [--limit N] [--all] [--db PATH]
 bench flags:   [--n N] [--reps R] [--concurrency C] [--json] [--db PATH] [--gate]
                [--max-log-ms X] [--max-search-ms X] [--max-suggest-ms X] [--max-hook-ms X] [--min-inserts-per-s X]
@@ -249,5 +249,54 @@ mod integration {
         assert_eq!(ok.len(), 1);
         assert_eq!(bad.len(), 1);
         assert_eq!(ok[0].1, 0);
+    }
+
+    #[test]
+    fn suggest_skips_sensitive_entries() {
+        let conn = memdb();
+        let mut sensitive = entry("deploy --token [REDACTED]", "/r", 0, 100);
+        sensitive.sensitive = true;
+        db::insert(&conn, &sensitive).unwrap();
+        db::insert(&conn, &entry("deploy --prod", "/r", 0, 101)).unwrap();
+        let cands = db::suggest(&conn, "deploy", "/r", 5).unwrap();
+        assert_eq!(cands, vec!["deploy --prod"]);
+    }
+
+    #[test]
+    fn search_short_query_uses_like_fallback() {
+        let conn = memdb();
+        db::insert(&conn, &entry("git status", "/r", 0, 100)).unwrap();
+        let rows = db::search(&conn, "gi", 10, None, None, None, None, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].3, "git status");
+    }
+
+    #[test]
+    fn search_matches_cwd_via_fts() {
+        let conn = memdb();
+        db::insert(&conn, &entry("ls -la", "/repo/alpha", 0, 100)).unwrap();
+        let rows = db::search(&conn, "alpha", 10, None, None, None, None, None).unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn search_treats_like_wildcards_literally() {
+        let conn = memdb();
+        db::insert(&conn, &entry("echo 100% done", "/r", 0, 100)).unwrap();
+        db::insert(&conn, &entry("echo 100x done", "/r", 0, 101)).unwrap();
+        let rows = db::search(&conn, "100%", 10, None, None, None, None, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].3, "echo 100% done");
+    }
+
+    #[test]
+    fn suggest_plan_uses_command_index() {
+        let conn = memdb();
+        db::insert(&conn, &entry("git status", "/r", 0, 100)).unwrap();
+        let plan = db::suggest_plan(&conn).unwrap().join("\n");
+        assert!(
+            plan.contains("idx_cmd"),
+            "plan did not use idx_cmd:\n{plan}"
+        );
     }
 }

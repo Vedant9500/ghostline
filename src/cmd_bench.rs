@@ -258,7 +258,7 @@ pub fn run(opts: &BenchOpts) -> Result<BenchReport, String> {
     let db_bytes = file_bytes(&dbp);
     let binary_bytes = file_bytes(&exe);
     let objs = db::schema_objects(&conn).map_err(|e| format!("schema: {e}"))?;
-    let need = ["history", "history_fts", "idx_cwd", "idx_session", "idx_time"];
+    let need = ["history", "history_fts", "idx_cmd", "idx_cwd", "idx_session", "idx_time"];
     let indexes_ok = need.iter().all(|n| objs.iter().any(|o| o == n));
 
     let report = BenchReport {
@@ -322,7 +322,7 @@ pub fn check_gate(report: &BenchReport, opts: &BenchOpts) -> Vec<GateCheck> {
         GateCheck {
             name: "indexes",
             ok: report.indexes_ok,
-            detail: "history, history_fts, idx_time, idx_cwd, idx_session present".into(),
+            detail: "history, history_fts, idx_cmd, idx_time, idx_cwd, idx_session present".into(),
         },
     ]
 }
@@ -553,7 +553,7 @@ mod tests {
         assert!(!db::search_plan(&conn).unwrap().is_empty());
         assert!(!db::suggest_plan(&conn).unwrap().is_empty());
         let objs = db::schema_objects(&conn).unwrap();
-        for need in ["history", "history_fts", "idx_time", "idx_cwd", "idx_session"] {
+        for need in ["history", "history_fts", "idx_cmd", "idx_time", "idx_cwd", "idx_session"] {
             assert!(objs.contains(&need.to_string()), "missing {need}: {objs:?}");
         }
         std::fs::remove_dir_all(&dir).ok();

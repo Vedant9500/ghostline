@@ -381,6 +381,51 @@ mod integration {
     }
 
     #[test]
+    fn open_migrates_legacy_v0_table_without_import_key() {
+        let dir = std::env::temp_dir().join(format!("gl-migrate-v0-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.db");
+        {
+            let conn = db::open(&path).unwrap();
+            db::insert(&conn, &entry("opencode", "/repo", 0, 100)).unwrap();
+            // Simulate a database created before user_version existed and
+            // before the import_key column: re-baselining must not try to
+            // index a column that is not there yet.
+            conn.execute_batch(
+                "DROP INDEX idx_import_key;
+                 ALTER TABLE history DROP COLUMN import_key;",
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 0).unwrap();
+        }
+        let conn = db::open(&path).unwrap();
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, db::SCHEMA_VERSION);
+        let column: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('history') WHERE name='import_key'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(column, 1);
+        let index: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='idx_import_key'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(index, 1);
+        let cands = db::suggest(&conn, "ope", "/repo", 5).unwrap();
+        assert_eq!(cands, vec!["opencode"]);
+        drop(conn);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn open_rejects_newer_schema_version() {
         let dir = std::env::temp_dir().join(format!("gl-newer-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

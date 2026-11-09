@@ -46,7 +46,9 @@ const READ_BUSY_TIMEOUT_MS: u64 = 100;
 pub const SCHEMA_VERSION: i64 = 3;
 
 /// Cumulative baseline DDL (version 0 -> latest). Idempotent, so re-baselining
-/// an existing pre-migration database is safe.
+/// an existing pre-migration database is safe. Indexes that depend on a column
+/// added by a migration (for example `import_key`) live in that migration, not
+/// here, so re-baselining a legacy table without the column cannot fail.
 pub const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS history(
   id TEXT PRIMARY KEY,
@@ -76,10 +78,9 @@ CREATE INDEX IF NOT EXISTS idx_session ON history(session_id, started_at);
 -- successful, non-sensitive rows only; cmd/cwd/started_at read from the index.
 CREATE INDEX IF NOT EXISTS idx_cmd ON history(cmd COLLATE NOCASE, cwd, started_at DESC)
   WHERE exit_code = 0 AND sensitive = 0;
--- Imported rows carry a deterministic key so re-importing the same HISTFILE
--- skips rows already present instead of duplicating the whole file.
-CREATE UNIQUE INDEX IF NOT EXISTS idx_import_key ON history(import_key)
-  WHERE import_key IS NOT NULL;
+-- idx_import_key is created by migration_3, after the column exists. Keeping
+-- it out of the baseline lets a pre-versioning database (user_version=0) whose
+-- table predates import_key still re-baseline without error.
 CREATE VIRTUAL TABLE IF NOT EXISTS history_fts USING fts5(cmd, cwd, tokenize='trigram');
 CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
   INSERT INTO history_fts(rowid, cmd, cwd) VALUES (new.rowid, new.cmd, new.cwd);

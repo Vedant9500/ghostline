@@ -60,6 +60,8 @@ pub struct BenchReport {
     pub binary_bytes: u64,
     pub rss_kb: u64,
     pub indexes_ok: bool,
+    pub search_plan_ok: bool,
+    pub suggest_plan_ok: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -118,6 +120,22 @@ fn is_busy(e: &rusqlite::Error) -> bool {
         if e.code == rusqlite::ErrorCode::DatabaseBusy)
 }
 
+/// A base-table full scan means the budgeted index was not used. The FTS
+/// virtual-table scan in the search plan is expected and is not flagged.
+fn plan_scans_history(plan: &[String]) -> bool {
+    plan.iter().any(|line| {
+        let line = line.trim_start();
+        line.starts_with("SCAN h ")
+            || line == "SCAN h"
+            || line.starts_with("SCAN history ")
+            || line == "SCAN history"
+    })
+}
+
+fn plan_contains(plan: &[String], needle: &str) -> bool {
+    plan.iter().any(|line| line.contains(needle))
+}
+
 /// Batch throughput helper (also used by the non-vacuous NORMAL-vs-FULL test).
 pub fn batch_throughput(conn: &rusqlite::Connection, n: usize) -> rusqlite::Result<f64> {
     let batch: Vec<db::Entry> = (0..n).map(bench_entry).collect();
@@ -159,6 +177,9 @@ pub fn run(opts: &BenchOpts) -> Result<BenchReport, String> {
         db::insert(&conn, &e).map_err(|e| format!("insert: {e}"))?;
         log_ms.push(t.elapsed().as_secs_f64() * 1000.0);
     }
+
+    // Give the planner realistic stats before measuring/asserting plans.
+    db::analyze(&conn).map_err(|e| format!("analyze: {e}"))?;
 
     // Query latencies over seeded rows.
     let reps = opts.reps.max(1);
@@ -260,6 +281,13 @@ pub fn run(opts: &BenchOpts) -> Result<BenchReport, String> {
     let objs = db::schema_objects(&conn).map_err(|e| format!("schema: {e}"))?;
     let need = ["history", "history_fts", "idx_cmd", "idx_cwd", "idx_session", "idx_time"];
     let indexes_ok = need.iter().all(|n| objs.iter().any(|o| o == n));
+    let search_plan = db::search_plan(&conn).map_err(|e| format!("search plan: {e}"))?;
+    let suggest_plan = db::suggest_plan(&conn).map_err(|e| format!("suggest plan: {e}"))?;
+    let search_plan_ok = plan_contains(&search_plan, "history_fts")
+        && plan_contains(&search_plan, "INTEGER PRIMARY KEY")
+        && !plan_scans_history(&search_plan);
+    let suggest_plan_ok =
+        plan_contains(&suggest_plan, "idx_cmd") && !plan_scans_history(&suggest_plan);
 
     let report = BenchReport {
         n: opts.n,
@@ -281,6 +309,8 @@ pub fn run(opts: &BenchOpts) -> Result<BenchReport, String> {
         binary_bytes,
         rss_kb: rss_kb(),
         indexes_ok,
+        search_plan_ok,
+        suggest_plan_ok,
     };
 
     drop(conn);
@@ -323,6 +353,16 @@ pub fn check_gate(report: &BenchReport, opts: &BenchOpts) -> Vec<GateCheck> {
             name: "indexes",
             ok: report.indexes_ok,
             detail: "history, history_fts, idx_cmd, idx_time, idx_cwd, idx_session present".into(),
+        },
+        GateCheck {
+            name: "search_plan",
+            ok: report.search_plan_ok,
+            detail: "history_fts + INTEGER PRIMARY KEY, no base-table scan".into(),
+        },
+        GateCheck {
+            name: "suggest_plan",
+            ok: report.suggest_plan_ok,
+            detail: "idx_cmd SEARCH, no base-table scan".into(),
         },
     ]
 }
@@ -470,6 +510,8 @@ mod tests {
         assert!(r.inserts_per_s > 0.0, "throughput must be positive");
         assert!(r.log_ms_p99 >= r.log_ms_p50);
         assert!(r.indexes_ok, "budgeted schema objects must exist");
+        assert!(r.search_plan_ok, "search plan must use the FTS join");
+        assert!(r.suggest_plan_ok, "suggest plan must use idx_cmd");
         assert!(!r.hook_subprocess, "cargo test harness is not the ghostline binary");
     }
 
@@ -522,12 +564,28 @@ mod tests {
             binary_bytes: 0,
             rss_kb: 0,
             indexes_ok: true,
+            search_plan_ok: true,
+            suggest_plan_ok: true,
         };
         assert!(check_gate(&r, &o).iter().any(|c| !c.ok));
         r.log_ms_p99 = 0.5;
         r.indexes_ok = false;
+        r.suggest_plan_ok = false;
         let checks = check_gate(&r, &o);
         assert!(!checks.iter().find(|c| c.name == "indexes").unwrap().ok);
+        assert!(!checks.iter().find(|c| c.name == "suggest_plan").unwrap().ok);
+        assert!(checks.iter().find(|c| c.name == "search_plan").unwrap().ok);
+    }
+
+    #[test]
+    fn plan_checks_reject_base_table_scans() {
+        let ok = vec![
+            "SCAN history_fts VIRTUAL TABLE INDEX 0:M2".to_string(),
+            "SEARCH h USING INTEGER PRIMARY KEY (rowid=?)".to_string(),
+        ];
+        assert!(!plan_scans_history(&ok));
+        let bad = vec!["SCAN h".to_string()];
+        assert!(plan_scans_history(&bad));
     }
 
     #[test]

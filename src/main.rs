@@ -30,7 +30,7 @@ Usage:
 log flags:     --shell S --cwd DIR --exit CODE --session ID [--db PATH] [--queue] [--queue-dir D]
 daemon flags:  [--once] [--interval-ms N] [--queue-dir D] [--db PATH]
 fix flags:     [--last] [--exit CODE] [--cwd DIR] [--db P] [-q]
-search flags:  [--limit N] [--dir DIR] [--exit 0|!0] [--session S] [--host H] [--since UNIX_SECS] [--db PATH]
+search flags:  [--limit N] [--dir DIR] [--exit N|!N] [--session S] [--host H] [--since UNIX_SECS] [--db PATH]
 suggest flags: [--cwd DIR] [--limit N] [--all] [--db PATH]
 bench flags:   [--n N] [--reps R] [--concurrency C] [--json] [--db PATH] [--gate]
                [--max-log-ms X] [--max-search-ms X] [--max-suggest-ms X] [--max-hook-ms X] [--min-inserts-per-s X]
@@ -380,6 +380,137 @@ mod integration {
         }
         assert!(db::open(&path).is_err());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn search_exit_accepts_arbitrary_codes() {
+        let conn = memdb();
+        db::insert(&conn, &entry("make", "/r", 0, 100)).unwrap();
+        db::insert(&conn, &entry("make", "/r", 2, 101)).unwrap();
+        db::insert(&conn, &entry("make", "/r", 127, 102)).unwrap();
+        let eq2 = db::search(&conn, "make", 10, None, Some("2"), None, None, None).unwrap();
+        assert_eq!(eq2.len(), 1);
+        assert_eq!(eq2[0].1, 2);
+        let ne0 = db::search(&conn, "make", 10, None, Some("!0"), None, None, None).unwrap();
+        assert_eq!(ne0.len(), 2);
+        let ne2 = db::search(&conn, "make", 10, None, Some("!2"), None, None, None).unwrap();
+        assert_eq!(ne2.len(), 2);
+        assert!(db::parse_exit_filter("bogus").is_none());
+        assert!(db::parse_exit_filter("!").is_none());
+    }
+
+    #[test]
+    fn search_ties_are_deterministic() {
+        let conn = memdb();
+        db::insert(&conn, &entry("first", "/r", 0, 100)).unwrap();
+        db::insert(&conn, &entry("second", "/r", 0, 100)).unwrap();
+        conn.execute("UPDATE history SET id='id-a' WHERE cmd='first'", [])
+            .unwrap();
+        conn.execute("UPDATE history SET id='id-b' WHERE cmd='second'", [])
+            .unwrap();
+        let rows = db::search(&conn, "", 10, None, None, None, None, None).unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.3.as_str()).collect::<Vec<_>>(),
+            vec!["second", "first"]
+        );
+    }
+
+    #[test]
+    fn suggest_ties_are_deterministic() {
+        let conn = memdb();
+        db::insert(&conn, &entry("tool beta", "/r", 0, 100)).unwrap();
+        db::insert(&conn, &entry("tool alpha", "/r", 0, 100)).unwrap();
+        let cands = db::suggest(&conn, "tool", "/r", 5).unwrap();
+        assert_eq!(cands, vec!["tool alpha", "tool beta"]);
+    }
+
+    #[test]
+    fn fts_update_trigger_keeps_index_in_sync() {
+        let conn = memdb();
+        db::insert(&conn, &entry("old command", "/r", 0, 100)).unwrap();
+        conn.execute(
+            "UPDATE history SET cmd='new command' WHERE cmd='old command'",
+            [],
+        )
+        .unwrap();
+        let old = db::search(&conn, "old", 10, None, None, None, None, None).unwrap();
+        assert!(old.is_empty());
+        let new = db::search(&conn, "new", 10, None, None, None, None, None).unwrap();
+        assert_eq!(new.len(), 1);
+        assert_eq!(new[0].3, "new command");
+        conn.execute("DELETE FROM history WHERE cmd='new command'", [])
+            .unwrap();
+        let gone = db::search(&conn, "new", 10, None, None, None, None, None).unwrap();
+        assert!(gone.is_empty());
+    }
+
+    #[test]
+    fn migration_v1_adds_update_trigger() {
+        let dir = std::env::temp_dir().join(format!("gl-migrate2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.db");
+        {
+            let conn = db::open(&path).unwrap();
+            // Simulate a v1 database: no update trigger and the old FTS5
+            // `'delete'` insert in the delete trigger.
+            conn.execute_batch(
+                "DROP TRIGGER history_au;
+                 DROP TRIGGER history_ad;
+                 CREATE TRIGGER history_ad AFTER DELETE ON history BEGIN
+                   INSERT INTO history_fts(history_fts, rowid, cmd, cwd)
+                     VALUES('delete', old.rowid, old.cmd, old.cwd);
+                 END;",
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+        }
+        let conn = db::open(&path).unwrap();
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, db::SCHEMA_VERSION);
+        let triggers: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name='history_au'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(triggers, 1);
+        db::insert(&conn, &entry("delete me", "/r", 0, 100)).unwrap();
+        conn.execute("DELETE FROM history WHERE cmd='delete me'", [])
+            .unwrap();
+        assert!(
+            db::search(&conn, "delete", 10, None, None, None, None, None)
+                .unwrap()
+                .is_empty()
+        );
+        drop(conn);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn analyze_populates_planner_stats() {
+        let conn = memdb();
+        db::insert(&conn, &entry("git status", "/r", 0, 100)).unwrap();
+        db::analyze(&conn).unwrap();
+        let objs = db::schema_objects(&conn).unwrap();
+        assert!(
+            objs.iter().any(|o| o == "sqlite_stat1"),
+            "ANALYZE must create sqlite_stat1: {objs:?}"
+        );
+        db::optimize(&conn).unwrap();
+    }
+
+    #[test]
+    fn empty_xdg_base_is_ignored() {
+        use std::ffi::OsString;
+        assert_eq!(db::path_from_env(None), None);
+        assert_eq!(db::path_from_env(Some(OsString::new())), None);
+        assert_eq!(
+            db::path_from_env(Some(OsString::from("/tmp/base"))),
+            Some(std::path::PathBuf::from("/tmp/base"))
+        );
     }
 
     #[cfg(unix)]

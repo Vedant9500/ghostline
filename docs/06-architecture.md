@@ -59,6 +59,16 @@ CREATE INDEX idx_cmd ON history(cmd COLLATE NOCASE, cwd, started_at DESC)
   WHERE exit_code = 0 AND sensitive = 0;
 
 CREATE VIRTUAL TABLE history_fts USING fts5(cmd, cwd, tokenize='trigram');
+CREATE TRIGGER history_ai AFTER INSERT ON history BEGIN
+  INSERT INTO history_fts(rowid, cmd, cwd) VALUES (new.rowid, new.cmd, new.cwd);
+END;
+CREATE TRIGGER history_ad AFTER DELETE ON history BEGIN
+  DELETE FROM history_fts WHERE rowid = old.rowid;
+END;
+CREATE TRIGGER history_au AFTER UPDATE ON history BEGIN
+  DELETE FROM history_fts WHERE rowid = old.rowid;
+  INSERT INTO history_fts(rowid, cmd, cwd) VALUES (new.rowid, new.cmd, new.cwd);
+END;
 
 CREATE TABLE sessions(
   session_id TEXT PRIMARY KEY,
@@ -71,7 +81,7 @@ CREATE TABLE sync_state(
 );
 ```
 
-Notes: cap `cmd` ~8KB (overflow → blob table or `truncated=1`); never store `env` wholesale (hashed allowlist only); UUIDv7 + `(started_at, device_id)` = merge order without server. Schema version is stored in `PRAGMA user_version` (currently 1); `db::open` applies the baseline DDL only when upgrading and refuses databases written by a newer version.
+Notes: cap `cmd` ~8KB (overflow → blob table or `truncated=1`); never store `env` wholesale (hashed allowlist only); UUIDv7 + `(started_at, device_id)` = merge order without server. Schema version is stored in `PRAGMA user_version` (currently 2); `db::open` applies the baseline DDL and versioned steps only when upgrading and refuses databases written by a newer version. `ghostline import` runs `ANALYZE` after bulk loads, and the daemon runs `PRAGMA optimize` after each batch.
 
 ## Shell integration
 

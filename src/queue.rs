@@ -20,14 +20,13 @@ pub struct QueuedEntry {
 
 /// Queue dir: $XDG_CACHE_HOME/ghostline/queue or ~/.cache/ghostline/queue
 pub fn default_queue_dir() -> PathBuf {
-    if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
-        let mut p = PathBuf::from(xdg);
+    if let Some(xdg) = crate::db::path_from_env(std::env::var_os("XDG_CACHE_HOME")) {
+        let mut p = xdg;
         p.push("ghostline/queue");
         return p;
     }
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
+    let home =
+        crate::db::path_from_env(std::env::var_os("HOME")).unwrap_or_else(|| PathBuf::from("."));
     let mut p = home;
     p.push(".cache/ghostline/queue");
     p

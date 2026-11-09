@@ -33,6 +33,10 @@ pub fn drain_once(
         for chunk in batch.chunks(500) {
             inserted += db::insert_batch(&conn, chunk).map_err(|e| format!("insert: {e}"))?;
         }
+        // Background path: let SQLite refresh planner stats if it decides the
+        // table has changed enough, then trim the WAL. Maintenance is
+        // best-effort so it cannot strand the already-claimed queue file.
+        db::optimize(&conn).ok();
         conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);").ok();
     }
     std::fs::remove_file(&claimed).map_err(|e| format!("remove claimed queue: {e}"))?;

@@ -12,7 +12,7 @@ It is for people who want faster history recall and inline correction without a 
 
 - `ghostline log` records one row per command: command, cwd, exit code, timestamp, hostname, session, shell, and sensitive flag. Commands are whitespace-normalized, capped at 8 KiB, and self-commands (`ghostline ...`) are skipped.
 - Hooks come from `ghostline init bash|zsh|fish`. Bash uses `PROMPT_COMMAND` plus `history 1`; zsh uses `preexec`/`precmd`; fish uses `fish_postexec`.
-- Storage is SQLite in WAL mode with a `history` table, time/cwd/session/prefix indexes, and an FTS5 virtual table with insert/delete triggers. The database, its WAL/SHM sidecars, and the `ghostline` data directory are private (`0600`/`0700`).
+- Storage is SQLite in WAL mode with a `history` table, time/cwd/session/prefix indexes, and an FTS5 virtual table with insert/update/delete triggers. The database, its WAL/SHM sidecars, and the `ghostline` data directory are private (`0600`/`0700`).
 - An optional JSONL ingest queue (`log --queue` or `GHOSTLINE_QUEUE=1`) is drained by `ghostline daemon` in batches of 500 rows.
 - `ghostline import` reads a bash-style `HISTFILE`, including `#<unix-seconds>` timestamps.
 
@@ -31,9 +31,9 @@ It is for people who want faster history recall and inline correction without a 
 
 **Search and diagnostics**
 
-- `ghostline search` uses FTS5 trigram phrase matching for queries of at least three characters, with a `LIKE` fallback for shorter queries. Filters cover cwd, exit status (`0` or `!0`), session, host, and timestamp. Output is tab-separated: timestamp (Unix ns), exit code, cwd, command.
+- `ghostline search` uses FTS5 trigram phrase matching for queries of at least three characters, with a `LIKE` fallback for shorter queries. Filters cover cwd (including subdirectories), exit status (`N` or `!N`), session, host, and timestamp. Output is tab-separated: timestamp (Unix ns), exit code, cwd, command.
 - No fzf/skim binding or `Ctrl-R` hijack is installed.
-- `ghostline bench` reports log/search/suggest/hook percentiles, inserts per second, BUSY count, WAL and DB sizes, binary size, RSS, and schema presence. `--gate` exits non-zero when a budget is exceeded; `--json` emits a machine-readable report.
+- `ghostline bench` reports log/search/suggest/hook percentiles, inserts per second, BUSY count, WAL and DB sizes, binary size, RSS, and schema presence. `--gate` exits non-zero when a budget is exceeded or a query plan loses its FTS/index path; `--json` emits a machine-readable report.
 
 ### Roadmap / not yet implemented
 
@@ -112,7 +112,7 @@ With the shell ghost, `Ctrl-G` previews; `Right`/`Ctrl-F`/`End` accept at end of
 | `ghostline daemon [--once]` | Drain the queue once or in a loop | `--once`, `--interval-ms N`, `--queue-dir D`, `--db PATH` |
 | `ghostline import [--from HISTFILE]` | Bulk-import a bash history file | `--from HISTFILE` |
 | `ghostline fix [--last] [command...]` | Print `did you mean` candidates; exit 0 when found | `--last`, `--exit CODE`, `--cwd DIR`, `--db PATH`, `-q` |
-| `ghostline search [flags] [query]` | Search history and print TSV rows | `--limit N`, `--dir DIR`, `--exit 0` or `!0`, `--session S`, `--host H`, `--since UNIX_SECS`, `--db PATH` |
+| `ghostline search [flags] [query]` | Search history and print TSV rows | `--limit N`, `--dir DIR`, `--exit N` or `!N`, `--session S`, `--host H`, `--since UNIX_SECS`, `--db PATH` |
 | `ghostline suggest [flags] <buffer>` | Print the next ghost suffix, or full commands with `--all` | `--cwd DIR`, `--limit N`, `--all`, `--db PATH` |
 | `ghostline bench [flags]` | Run measurements and optional gate | `--n N`, `--reps R`, `--concurrency C`, `--json`, `--db PATH`, `--gate`, `--max-log-ms X`, `--max-search-ms X`, `--max-suggest-ms X`, `--max-hook-ms X`, `--min-inserts-per-s X` |
 

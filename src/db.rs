@@ -1,16 +1,21 @@
 use rusqlite::{Connection, params, params_from_iter};
 use std::path::PathBuf;
 
+/// Treat an exported-but-empty XDG variable as unset (the XDG spec says an
+/// empty value means "use the default"), so we never create `./ghostline/...`
+/// in the caller's current directory.
+pub(crate) fn path_from_env(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    value.filter(|v| !v.is_empty()).map(PathBuf::from)
+}
+
 /// Default DB path: $XDG_DATA_HOME/ghostline/history.db or ~/.local/share/ghostline/history.db
 pub fn default_db_path() -> PathBuf {
-    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
-        let mut p = PathBuf::from(xdg);
+    if let Some(xdg) = path_from_env(std::env::var_os("XDG_DATA_HOME")) {
+        let mut p = xdg;
         p.push("ghostline/history.db");
         return p;
     }
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
+    let home = path_from_env(std::env::var_os("HOME")).unwrap_or_else(|| PathBuf::from("."));
     let mut p = home;
     p.push(".local/share/ghostline/history.db");
     p
@@ -24,15 +29,15 @@ PRAGMA busy_timeout=5000;
 PRAGMA foreign_keys=ON;
 ";
 
-/// Baseline schema version stored in `PRAGMA user_version`.
+/// Current schema version stored in `PRAGMA user_version`.
 ///
-/// Bump this whenever the DDL below changes, and add the matching
-/// `ALTER`/`CREATE` step to `migrate()`. A database at the current version
-/// skips the DDL entirely, so new objects must never live only in `SCHEMA`.
-pub const SCHEMA_VERSION: i64 = 1;
+/// Bump this whenever the schema changes and add the matching step to
+/// `migrate()`. The cumulative baseline below is also kept current so fresh
+/// databases and tests get the latest shape in one batch.
+pub const SCHEMA_VERSION: i64 = 2;
 
-/// Baseline DDL (version 0 -> 1). Idempotent, so re-baselining an existing
-/// pre-migration database is safe.
+/// Cumulative baseline DDL (version 0 -> latest). Idempotent, so re-baselining
+/// an existing pre-migration database is safe.
 pub const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS history(
   id TEXT PRIMARY KEY,
@@ -66,7 +71,26 @@ CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
   INSERT INTO history_fts(rowid, cmd, cwd) VALUES (new.rowid, new.cmd, new.cwd);
 END;
 CREATE TRIGGER IF NOT EXISTS history_ad AFTER DELETE ON history BEGIN
-  INSERT INTO history_fts(history_fts, rowid, cmd, cwd) VALUES('delete', old.rowid, old.cmd, old.cwd);
+  DELETE FROM history_fts WHERE rowid = old.rowid;
+END;
+CREATE TRIGGER IF NOT EXISTS history_au AFTER UPDATE ON history BEGIN
+  DELETE FROM history_fts WHERE rowid = old.rowid;
+  INSERT INTO history_fts(rowid, cmd, cwd) VALUES (new.rowid, new.cmd, new.cwd);
+END;
+";
+
+/// Version 1 -> 2: keep the FTS index in sync on updates, and repair the
+/// delete trigger. `history_fts` is a regular FTS5 table, so the special
+/// `'delete'` insert used by older databases raises "SQL logic error"; a
+/// plain `DELETE ... WHERE rowid` is the correct operation.
+const MIGRATION_2: &str = "
+DROP TRIGGER IF EXISTS history_ad;
+CREATE TRIGGER history_ad AFTER DELETE ON history BEGIN
+  DELETE FROM history_fts WHERE rowid = old.rowid;
+END;
+CREATE TRIGGER IF NOT EXISTS history_au AFTER UPDATE ON history BEGIN
+  DELETE FROM history_fts WHERE rowid = old.rowid;
+  INSERT INTO history_fts(rowid, cmd, cwd) VALUES (new.rowid, new.cmd, new.cwd);
 END;
 ";
 
@@ -146,6 +170,13 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         tx.pragma_update(None, "user_version", 1)?;
         tx.commit()?;
         version = 1;
+    }
+    if version < 2 {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_2)?;
+        tx.pragma_update(None, "user_version", 2)?;
+        tx.commit()?;
+        version = 2;
     }
     debug_assert_eq!(version, SCHEMA_VERSION, "missing migration step");
     Ok(())
@@ -267,9 +298,18 @@ fn dir_bounds(dir: &str) -> (String, String) {
     }
 }
 
+/// Parse an exit filter: `N` means exit code N, `!N` means anything but N.
+pub fn parse_exit_filter(raw: &str) -> Option<(bool, i64)> {
+    let (negated, digits) = match raw.strip_prefix('!') {
+        Some(rest) => (true, rest),
+        None => (false, raw),
+    };
+    digits.parse::<i64>().ok().map(|code| (negated, code))
+}
+
 /// Frecency-ish search. FTS5 trigram phrase when the query is matchable,
 /// LIKE fallback for 1-2 character queries (trigrams cannot match those).
-/// Filters: cwd subtree (`--dir` includes descendants), exit ("0" | "!0"),
+/// Filters: cwd subtree (`--dir` includes descendants), exit (`N` or `!N`),
 /// session, host, since (unix nanoseconds; `cmd_search` converts seconds).
 pub fn search_sql(
     query: &str,
@@ -280,11 +320,16 @@ pub fn search_sql(
     since: Option<i64>,
 ) -> String {
     let dir = dir.map(normalize_dir).filter(|d| !d.is_empty());
-    let exit_clause = match exit_filter {
-        Some("0") => "AND h.exit_code = 0",
-        Some("!0") => "AND h.exit_code != 0",
-        _ => "",
-    };
+    // Only parsed integers are interpolated, so this has no injection surface.
+    let exit_clause = exit_filter
+        .and_then(parse_exit_filter)
+        .map(|(negated, code)| {
+            if negated {
+                format!("AND h.exit_code != {code}")
+            } else {
+                format!("AND h.exit_code = {code}")
+            }
+        });
     let fts = use_fts(query);
     let mut sql = String::from("SELECT h.started_at, h.exit_code, h.cwd, h.cmd FROM history h ");
     if fts {
@@ -307,7 +352,10 @@ pub fn search_sql(
     } else {
         sql.push_str("AND ?2 IS NULL ");
     }
-    sql.push_str(exit_clause);
+    if let Some(clause) = exit_clause {
+        sql.push_str(&clause);
+        sql.push(' ');
+    }
     if session.is_some() {
         sql.push_str(" AND h.session_id = ?3");
     } else {
@@ -323,7 +371,7 @@ pub fn search_sql(
     } else {
         sql.push_str(" AND ?5 IS NULL");
     }
-    sql.push_str(" ORDER BY h.started_at DESC LIMIT ?6");
+    sql.push_str(" ORDER BY h.started_at DESC, h.id DESC LIMIT ?6");
     sql
 }
 
@@ -385,7 +433,7 @@ pub const SUGGEST_SQL: &str = "SELECT cmd,
          WHERE cmd LIKE ?1 ESCAPE '\\' AND cmd != ?4
            AND exit_code = 0 AND sensitive = 0
          GROUP BY cmd COLLATE NOCASE
-         ORDER BY w DESC, last_seen DESC
+         ORDER BY w DESC, last_seen DESC, cmd COLLATE NOCASE
          LIMIT ?3";
 
 /// Ghost suggestion: prefix candidates ranked by dir-affinity + frequency + recency.
@@ -455,4 +503,16 @@ pub fn schema_objects(conn: &Connection) -> rusqlite::Result<Vec<String>> {
     )?;
     let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
     rows.collect()
+}
+
+/// Refresh planner statistics after a bulk load. `ANALYZE` is a full pass over
+/// the indexed tables, so only the import/bench paths call it.
+pub fn analyze(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch("ANALYZE;")
+}
+
+/// Cheap periodic maintenance for long-lived writers. SQLite decides whether
+/// any table needs `ANALYZE`; safe to call after a daemon batch.
+pub fn optimize(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch("PRAGMA optimize;")
 }

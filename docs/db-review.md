@@ -32,7 +32,7 @@
 | 19 | Low | No deterministic tie-break in `search`/`suggest` ordering | 165, 211 |
 | 20 | Low | Imports with no timestamps share one `started_at`, so ties are arbitrary | `cmd_import.rs:14` |
 
-> **Status (2026-11-09):** findings 1–12 are fixed in the working tree, along with removal of the dead helper (#17). The remaining low findings (13–16 and 18–20) are open. See [Resolution log](#resolution-log-2026-11-09).
+> **Status (2026-11-09):** all findings 1–20 are fixed in the working tree. See [Resolution log](#resolution-log-2026-11-09).
 
 ---
 
@@ -378,8 +378,15 @@ Query plans and SQL timings were measured with the `sqlite3` 3.54.1 CLI on a war
 | 9. Suggest over-fetch starvation | Fixed | Control-tainted rows are still filtered in Rust, but the fetch size now doubles until enough clean candidates are found or the prefix is exhausted. Write-time sanitization keeps the first query sufficient for new data. |
 | 10. Negative/oversized limits | Fixed | `db::search` clamps `limit` to `0..=10_000` before binding, so `--limit -1` no longer means "no limit" and huge values cannot overflow the suggest over-fetch. |
 | 11. WAL/SHM permissions | Fixed | `db::open` creates missing data directories `0700` and chmods the DB plus `-wal`/`-shm` sidecars `0600`; `insert_batch` re-applies after writes because SQLite recreates sidecars lazily. |
-| 12. No schema migrations | Fixed | `PRAGMAS` are split from the baseline DDL and `PRAGMA user_version` tracks `SCHEMA_VERSION = 1`. `open()` applies the baseline only on upgrade and rejects databases written by a newer version. |
+| 12. No schema migrations | Fixed | `PRAGMAS` are split from the baseline DDL and `PRAGMA user_version` tracks `SCHEMA_VERSION = 2`. `open()` applies the baseline plus versioned steps only on upgrade and rejects databases written by a newer version. |
+| 13. Bench gate blind spot | Fixed | The gate now asserts the search plan uses `history_fts` + `INTEGER PRIMARY KEY` and the suggest plan uses `idx_cmd`, and fails on a base-table scan. The bench also runs `ANALYZE` before measuring. |
+| 14. `--exit` silently ignored | Fixed | `--exit N` and `--exit !N` now accept any integer exit code; invalid values are rejected with an error. The SQL interpolates only parsed integers. |
+| 15. Empty `XDG_DATA_HOME` | Fixed | Empty XDG values are treated as unset for both the database and queue paths, so they never create relative directories in the cwd. |
+| 16. Missing FTS update trigger | Fixed | Added `history_au` (delete + reinsert on update) and repaired `history_ad`: `history_fts` is a regular FTS5 table, so the old `'delete'` insert raised "SQL logic error"; the trigger now uses `DELETE ... WHERE rowid`. Migration v1→v2 applies the fix. |
 | 17. Dead helper | Fixed | `latest_with_prefix` and its unused `OptionalExtension` import removed. |
+| 18. No planner stats | Fixed | `ghostline import` and the bench seed run `ANALYZE`; the daemon runs `PRAGMA optimize` after each batch. |
+| 19. Non-deterministic ties | Fixed | Search orders by `started_at DESC, id DESC`; suggest orders by weight, recency, then `cmd COLLATE NOCASE`. |
+| 20. Shared import timestamps | Fixed | Untimestamped HISTFILE lines get increasing fallback timestamps (`fallback + offset`), preserving file order. |
 
 Measured on the synthetic 500k-row database:
 
@@ -394,6 +401,8 @@ Measured on the synthetic 500k-row database:
 
 The FTS path trades the old early-exit win on very common substrings for large wins on misses and rare terms; both common and miss cases stay within the 50 ms search budget at 500k rows. Short queries cannot use trigrams and retain the old LIKE cost.
 
-Tests added: `since_to_ns` unit tests, `ghost_suffix` case/boundary tests, sensitive suppression, FTS/LIKE search behavior, wildcard literals, a plan assertion that suggest uses `idx_cmd`, `--dir` subtree/trailing-slash/root behavior, negative limits, suggest starvation, control stripping at log/import/search time, schema migration/version rejection, and Unix `0600`/`0700` permissions. `cargo test` is green (61 unit + 3 pty).
+Tests added: `since_to_ns` unit tests, `ghost_suffix` case/boundary tests, sensitive suppression, FTS/LIKE search behavior, wildcard literals, a plan assertion that suggest uses `idx_cmd`, `--dir` subtree/trailing-slash/root behavior, negative limits, suggest starvation, control stripping at log/import/search time, schema migration/version rejection, Unix `0600`/`0700` permissions, arbitrary exit filters, deterministic tie-breaks, FTS update/delete triggers, planner stats, empty-XDG handling, and increasing import timestamps. `cargo test` is green (70 unit + 3 pty).
+
+The v1→v2 migration test simulates an old database with the broken `'delete'` trigger, then verifies the repaired trigger and the new update trigger both work.
 
 For finding 9, a SQL-level `cmd NOT GLOB '*[control]*'` filter was measured but added ~30 ms to a common-prefix suggest at 500k rows (about 20 ms -> 53 ms). Adaptive over-fetch plus write-time sanitization keeps the common case at ~25 ms while still guaranteeing clean candidates from legacy databases.

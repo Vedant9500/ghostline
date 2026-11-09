@@ -16,6 +16,7 @@ fn hostname() -> String {
 pub fn parse_histfile(text: &str, fallback_ns: i64) -> Vec<(String, i64)> {
     let mut out = vec![];
     let mut pending_ts: Option<i64> = None;
+    let mut fallback_offset: i64 = 0;
     for raw in text.lines() {
         let line = raw.trim_end();
         if line.is_empty() {
@@ -37,7 +38,14 @@ pub fn parse_histfile(text: &str, fallback_ns: i64) -> Vec<(String, i64)> {
         if cmd.len() > MAX {
             cmd.truncate(MAX);
         }
-        out.push((cmd, pending_ts.unwrap_or(fallback_ns)));
+        // Untimestamped lines keep file order instead of all sharing one
+        // started_at (which made newest-first ordering arbitrary).
+        let ts = pending_ts.unwrap_or_else(|| {
+            let ts = fallback_ns.saturating_add(fallback_offset);
+            fallback_offset = fallback_offset.saturating_add(1);
+            ts
+        });
+        out.push((cmd, ts));
         pending_ts = None;
     }
     out
@@ -69,7 +77,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         i += 1;
     }
     let histfile = from.map(std::path::PathBuf::from).unwrap_or_else(|| {
-        let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_else(|| ".".into());
+        let home = db::path_from_env(std::env::var_os("HOME")).unwrap_or_else(|| ".".into());
         home.join(".bash_history")
     });
     let text = std::fs::read_to_string(&histfile).map_err(|e| format!("read {}: {e}", histfile.display()))?;
@@ -95,6 +103,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     for chunk in entries.chunks(500) {
         n += db::insert_batch(&conn, chunk).map_err(|e| format!("insert: {e}"))?;
     }
+    db::analyze(&conn).map_err(|e| format!("analyze: {e}"))?;
     println!("imported {n} commands from {}", histfile.display());
     Ok(())
 }
@@ -112,6 +121,15 @@ mod tests {
         assert_eq!(rows[1].0, "cargo test --all");
         assert_eq!(rows[1].1, 1727000060 * 1_000_000_000);
         assert_eq!(rows[2], ("not-a-timestamp #123".into(), 9));
+    }
+
+    #[test]
+    fn untimed_entries_get_increasing_timestamps() {
+        let rows = parse_histfile("one\ntwo\nthree\n", 100);
+        assert_eq!(
+            rows.iter().map(|(_, ts)| *ts).collect::<Vec<_>>(),
+            vec![100, 101, 102]
+        );
     }
 
     #[test]

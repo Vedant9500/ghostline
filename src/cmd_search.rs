@@ -39,7 +39,10 @@ pub fn run(args: &[String]) -> Result<(), String> {
             }
             "--exit" => {
                 i += 1;
-                exit_filter = args.get(i).cloned();
+                let raw = args.get(i).ok_or("--exit expects a value")?;
+                db::parse_exit_filter(raw)
+                    .ok_or_else(|| format!("invalid --exit value '{raw}' (use N or !N)"))?;
+                exit_filter = Some(raw.clone());
             }
             "--session" => {
                 i += 1;

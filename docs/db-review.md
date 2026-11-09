@@ -32,7 +32,7 @@
 | 19 | Low | No deterministic tie-break in `search`/`suggest` ordering | 165, 211 |
 | 20 | Low | Imports with no timestamps share one `started_at`, so ties are arbitrary | `cmd_import.rs:14` |
 
-> **Status (2026-11-09):** high findings 1–5 are fixed in the working tree, along with LIKE escaping (#6) and removal of the dead helper (#17). The remaining findings are still open. See [Resolution log](#resolution-log-2026-11-09).
+> **Status (2026-11-09):** findings 1–12 are fixed in the working tree, along with removal of the dead helper (#17). The remaining low findings (13–16 and 18–20) are open. See [Resolution log](#resolution-log-2026-11-09).
 
 ---
 
@@ -373,6 +373,12 @@ Query plans and SQL timings were measured with the `sqlite3` 3.54.1 CLI on a war
 | 4. Unused FTS | Fixed | `search` uses an FTS5 trigram phrase (`MATCH ?`) for queries of 3+ characters, with a LIKE fallback for 1–2 character queries; special characters are quoted literally. |
 | 5. Suggest full scan | Fixed | Bound `buffer || '%'` as one parameter, added the partial covering index `idx_cmd`, grouped by `cmd COLLATE NOCASE`, clamped limits, and escaped LIKE wildcards. |
 | 6. LIKE wildcards | Fixed (search + suggest) | `escape_like` + `ESCAPE '\'`; wildcards in queries/buffers are literal. |
+| 7. `--dir` exact vs prefix | Fixed | `--dir` now matches the directory and its descendants. The query uses an exact equality plus a `[dir/, dir0)` range, so `idx_cwd` still serves it via a multi-index OR. Trailing slashes and `/` are normalized. |
+| 8. Control bytes in search output | Fixed | `redact::strip_controls` removes C0/C1/DEL at log and import time, and `search` sanitizes `cwd`/`cmd` on output so pre-existing databases are safe too. |
+| 9. Suggest over-fetch starvation | Fixed | Control-tainted rows are still filtered in Rust, but the fetch size now doubles until enough clean candidates are found or the prefix is exhausted. Write-time sanitization keeps the first query sufficient for new data. |
+| 10. Negative/oversized limits | Fixed | `db::search` clamps `limit` to `0..=10_000` before binding, so `--limit -1` no longer means "no limit" and huge values cannot overflow the suggest over-fetch. |
+| 11. WAL/SHM permissions | Fixed | `db::open` creates missing data directories `0700` and chmods the DB plus `-wal`/`-shm` sidecars `0600`; `insert_batch` re-applies after writes because SQLite recreates sidecars lazily. |
+| 12. No schema migrations | Fixed | `PRAGMAS` are split from the baseline DDL and `PRAGMA user_version` tracks `SCHEMA_VERSION = 1`. `open()` applies the baseline only on upgrade and rejects databases written by a newer version. |
 | 17. Dead helper | Fixed | `latest_with_prefix` and its unused `OptionalExtension` import removed. |
 
 Measured on the synthetic 500k-row database:
@@ -388,4 +394,6 @@ Measured on the synthetic 500k-row database:
 
 The FTS path trades the old early-exit win on very common substrings for large wins on misses and rare terms; both common and miss cases stay within the 50 ms search budget at 500k rows. Short queries cannot use trigrams and retain the old LIKE cost.
 
-Tests added: `since_to_ns` unit tests, `ghost_suffix` case/boundary tests, sensitive suppression, FTS/LIKE search behavior, wildcard literals, and a plan assertion that suggest uses `idx_cmd`. `cargo test` is green (51 unit + 3 pty).
+Tests added: `since_to_ns` unit tests, `ghost_suffix` case/boundary tests, sensitive suppression, FTS/LIKE search behavior, wildcard literals, a plan assertion that suggest uses `idx_cmd`, `--dir` subtree/trailing-slash/root behavior, negative limits, suggest starvation, control stripping at log/import/search time, schema migration/version rejection, and Unix `0600`/`0700` permissions. `cargo test` is green (61 unit + 3 pty).
+
+For finding 9, a SQL-level `cmd NOT GLOB '*[control]*'` filter was measured but added ~30 ms to a common-prefix suggest at 500k rows (about 20 ms -> 53 ms). Adaptive over-fetch plus write-time sanitization keeps the common case at ~25 ms while still guaranteeing clean candidates from legacy databases.

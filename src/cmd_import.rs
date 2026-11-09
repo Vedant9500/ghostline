@@ -27,7 +27,7 @@ pub fn parse_histfile(text: &str, fallback_ns: i64) -> Vec<(String, i64)> {
                 continue;
             }
         }
-        let cmd = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        let cmd = crate::redact::clean_command(line);
         if cmd.is_empty() || cmd.starts_with("ghostline ") || cmd == "ghostline" {
             pending_ts = None;
             continue;
@@ -112,6 +112,14 @@ mod tests {
         assert_eq!(rows[1].0, "cargo test --all");
         assert_eq!(rows[1].1, 1727000060 * 1_000_000_000);
         assert_eq!(rows[2], ("not-a-timestamp #123".into(), 9));
+    }
+
+    #[test]
+    fn strips_terminal_controls() {
+        let text = "echo \x1b[7mBOLD\x1b[0m\n\x1b\n";
+        let rows = parse_histfile(text, 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "echo [7mBOLD[0m");
     }
 
     #[test]

@@ -22,7 +22,8 @@ pub fn build_entry(
     session: &str,
     cmd: &str,
 ) -> Option<db::Entry> {
-    let mut cmd = cmd.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Control bytes would be replayed as terminal escapes by search/ghost.
+    let mut cmd = redact::clean_command(cmd);
     if cmd.is_empty() {
         return None;
     }
@@ -144,4 +145,16 @@ pub fn run(args: &[String]) -> Result<bool, String> {
     let conn = db::open(&path).map_err(|e| format!("open db: {e}"))?;
     db::insert(&conn, &entry).map_err(|e| format!("insert: {e}"))?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_entry;
+
+    #[test]
+    fn strips_terminal_controls_before_persisting() {
+        let e = build_entry("bash", "/r", 0, "s", "echo \x1b[7mBOLD\x1b[0m").unwrap();
+        assert_eq!(e.cmd, "echo [7mBOLD[0m");
+        assert!(build_entry("bash", "/r", 0, "s", "\x1b\x07").is_none());
+    }
 }

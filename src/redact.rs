@@ -49,6 +49,24 @@ pub fn redact(cmd: &str) -> (String, bool) {
     (out, sensitive)
 }
 
+/// Remove C0/C1 controls (ESC, BEL, newline, DEL, ...). Stored commands are
+/// later replayed to a terminal by `search`/`suggest`, so untrusted history
+/// (HISTFILE imports, pasted commands) must not carry escape sequences.
+pub fn strip_controls(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// Normalize whitespace and strip terminal controls from a captured command.
+/// Normalize first so tabs/newlines still separate tokens, then normalize
+/// again to close gaps left by removed non-whitespace controls.
+pub fn clean_command(cmd: &str) -> String {
+    let cmd = cmd.split_whitespace().collect::<Vec<_>>().join(" ");
+    strip_controls(&cmd)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Tiny glob matcher supporting `*` (used for GHOSTLINE_IGNORE, comma/space separated).
 pub fn glob_match(pattern: &str, text: &str) -> bool {
     let p: Vec<u8> = pattern.bytes().collect();
@@ -133,6 +151,23 @@ mod tests {
         let (out, s) = redact("git status --short");
         assert!(!s);
         assert_eq!(out, "git status --short");
+    }
+
+    #[test]
+    fn strips_terminal_controls() {
+        assert_eq!(
+            strip_controls("echo \x1b[7mBOLD\x1b[0m\x07 ok"),
+            "echo [7mBOLD[0m ok"
+        );
+        assert_eq!(strip_controls("a\tb\nc\u{7f}d\u{9b}e"), "abcde");
+        assert_eq!(strip_controls("git status"), "git status");
+    }
+
+    #[test]
+    fn clean_command_normalizes_after_stripping() {
+        assert_eq!(clean_command("  echo \x1b  hi  "), "echo hi");
+        assert_eq!(clean_command("echo\tfoo\nbar"), "echo foo bar");
+        assert_eq!(clean_command("\x1b\x07"), "");
     }
 
     #[test]

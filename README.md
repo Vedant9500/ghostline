@@ -12,7 +12,7 @@ It is for people who want faster history recall and inline correction without a 
 
 - `ghostline log` records one row per command: command, cwd, exit code, timestamp, hostname, session, shell, and sensitive flag. Commands are whitespace-normalized, capped at 8 KiB, and self-commands (`ghostline ...`) are skipped.
 - Hooks come from `ghostline init bash|zsh|fish`. Bash uses `PROMPT_COMMAND` plus `history 1`; zsh uses `preexec`/`precmd`; fish uses `fish_postexec`.
-- Storage is SQLite in WAL mode with a `history` table, time/cwd/session/prefix indexes, and an FTS5 virtual table with insert/delete triggers. The main database file is chmod `0600` on creation.
+- Storage is SQLite in WAL mode with a `history` table, time/cwd/session/prefix indexes, and an FTS5 virtual table with insert/delete triggers. The database, its WAL/SHM sidecars, and the `ghostline` data directory are private (`0600`/`0700`).
 - An optional JSONL ingest queue (`log --queue` or `GHOSTLINE_QUEUE=1`) is drained by `ghostline daemon` in batches of 500 rows.
 - `ghostline import` reads a bash-style `HISTFILE`, including `#<unix-seconds>` timestamps.
 
@@ -116,7 +116,7 @@ With the shell ghost, `Ctrl-G` previews; `Right`/`Ctrl-F`/`End` accept at end of
 | `ghostline suggest [flags] <buffer>` | Print the next ghost suffix, or full commands with `--all` | `--cwd DIR`, `--limit N`, `--all`, `--db PATH` |
 | `ghostline bench [flags]` | Run measurements and optional gate | `--n N`, `--reps R`, `--concurrency C`, `--json`, `--db PATH`, `--gate`, `--max-log-ms X`, `--max-search-ms X`, `--max-suggest-ms X`, `--max-hook-ms X`, `--min-inserts-per-s X` |
 
-`ghostline --help` and `--version` are also available. Search defaults to 20 rows and suggest to 5; `search --dir` currently matches cwd exactly.
+`ghostline --help` and `--version` are also available. Search defaults to 20 rows and suggest to 5; `search --dir` matches the directory and every directory below it.
 
 ## How it works
 
@@ -169,10 +169,10 @@ Search uses trigram FTS for three-character-and-longer queries and a `LIKE` fall
 ## Privacy and security
 
 - Local-first: no sockets, telemetry, accounts, auto-update, or network calls in the default path.
-- The database defaults to `$XDG_DATA_HOME/ghostline/history.db` or `~/.local/share/ghostline/history.db`; the main file is chmod `0600`. The queue file defaults to `$XDG_CACHE_HOME/ghostline/queue/history.jsonl` or `~/.cache/ghostline/queue/history.jsonl`.
+- The database defaults to `$XDG_DATA_HOME/ghostline/history.db` or `~/.local/share/ghostline/history.db`; the database and its WAL/SHM sidecars are chmod `0600`, and the data directory is chmod `0700`. The queue file defaults to `$XDG_CACHE_HOME/ghostline/queue/history.jsonl` or `~/.cache/ghostline/queue/history.jsonl`.
 - Redaction runs before persistence for `log` and `import`. Rules cover common token formats (OpenAI, Anthropic, GitHub, AWS, Google, Slack, Stripe), JWTs, PEM private keys, database URLs with passwords, `curl -u`, and password/token/key/value patterns. Matches are replaced and the row is marked `sensitive=1`.
 - `GHOSTLINE_IGNORE` excludes matching commands from `log`; `GHOSTLINE_DISABLED` pauses logging and ghost painting. Suggestions never execute; `fix` only prints candidates.
-- Redaction is best-effort, not a guarantee. Sensitive rows are excluded from suggestions; SQLite `-wal`/`-shm` sidecars still follow the process umask rather than being explicitly chmodded.
+- Redaction is best-effort, not a guarantee. Sensitive rows are excluded from suggestions; the database and its WAL/SHM sidecars are chmodded `0600`, and the data directory is chmodded `0700`.
 
 ## Configuration
 

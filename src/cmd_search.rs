@@ -1,4 +1,4 @@
-use crate::db;
+use crate::{db, redact};
 
 const NS_PER_SEC: i64 = 1_000_000_000;
 /// Values below this are user-facing Unix seconds; larger values are already
@@ -88,7 +88,13 @@ pub fn run(args: &[String]) -> Result<(), String> {
     )
     .map_err(|e| format!("search: {e}"))?;
     for (ts, exit, cwd, cmd) in rows {
-        println!("{ts}\t{exit}\t{cwd}\t{cmd}");
+        // Databases written before write-time sanitization may still contain
+        // terminal escapes; never replay them to the caller's terminal.
+        println!(
+            "{ts}\t{exit}\t{}\t{}",
+            redact::strip_controls(&cwd),
+            redact::strip_controls(&cmd)
+        );
     }
     Ok(())
 }

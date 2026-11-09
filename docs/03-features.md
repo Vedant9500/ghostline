@@ -26,7 +26,7 @@
 - Learn dismissals: 2× dismiss suppresses pattern 24h.
 
 ### F5. `ghostline search` (history UI)
-- FTS5 trigram + filters: `--dir`, `--host`, `--session`, `--exit 0/!0`, `--since UNIX_SECS`, `--limit`.
+- FTS5 trigram + filters: `--dir` (subtree), `--host`, `--session`, `--exit 0/!0`, `--since UNIX_SECS`, `--limit`.
 - fzf/skim binding (`Ctrl-R` opt-in, never hijack `↑` by default). `F2`/flag to delete entry. Import: `ghostline import --from histfile`.
 
 ### F6. Privacy + safety rails

@@ -1,4 +1,4 @@
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, params, params_from_iter};
 use std::path::PathBuf;
 
 /// Default DB path: $XDG_DATA_HOME/ghostline/history.db or ~/.local/share/ghostline/history.db
@@ -16,11 +16,24 @@ pub fn default_db_path() -> PathBuf {
     p
 }
 
-pub const SCHEMA: &str = "
+/// Per-connection settings. Safe to re-apply on every open.
+const PRAGMAS: &str = "
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
 PRAGMA busy_timeout=5000;
 PRAGMA foreign_keys=ON;
+";
+
+/// Baseline schema version stored in `PRAGMA user_version`.
+///
+/// Bump this whenever the DDL below changes, and add the matching
+/// `ALTER`/`CREATE` step to `migrate()`. A database at the current version
+/// skips the DDL entirely, so new objects must never live only in `SCHEMA`.
+pub const SCHEMA_VERSION: i64 = 1;
+
+/// Baseline DDL (version 0 -> 1). Idempotent, so re-baselining an existing
+/// pre-migration database is safe.
+pub const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS history(
   id TEXT PRIMARY KEY,
   cmd TEXT NOT NULL,
@@ -57,19 +70,85 @@ CREATE TRIGGER IF NOT EXISTS history_ad AFTER DELETE ON history BEGIN
 END;
 ";
 
-/// Open (creating parents) + apply schema. DB file chmod 600 on creation.
+/// Create missing parent directories (0700 when we own the leaf) and open the
+/// database. The main file and its WAL/SHM sidecars are private (0600) because
+/// they contain raw command history.
 pub fn open(path: &std::path::Path) -> rusqlite::Result<Connection> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
+    ensure_parent(path);
     let conn = Connection::open(path)?;
-    conn.execute_batch(SCHEMA)?;
+    conn.execute_batch(PRAGMAS)?;
+    migrate(&conn)?;
+    secure_db_files(path);
+    Ok(conn)
+}
+
+fn ensure_parent(path: &std::path::Path) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if parent.as_os_str().is_empty() {
+        return;
+    }
+    let existed = parent.exists();
+    std::fs::create_dir_all(parent).ok();
+    #[cfg(unix)]
+    {
+        use std::ffi::OsStr;
+        use std::os::unix::fs::PermissionsExt;
+        // A newly created leaf is ours; an existing "ghostline" directory is
+        // the default data dir and should never be group/world readable.
+        let is_data_dir = parent.file_name() == Some(OsStr::new("ghostline"));
+        if !existed || is_data_dir {
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).ok();
+        }
+    }
+}
+
+/// chmod the database and its WAL/SHM sidecars. SQLite creates sidecars with
+/// the database's mode at creation time; a later chmod only covers the main
+/// file, so re-apply after writes as well.
+fn secure_db_files(path: &std::path::Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).ok();
+        for suffix in ["-wal", "-shm"] {
+            let mut sidecar = path.as_os_str().to_owned();
+            sidecar.push(suffix);
+            std::fs::set_permissions(
+                std::path::PathBuf::from(sidecar),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .ok();
+        }
     }
-    Ok(conn)
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+/// Apply pending schema migrations. Version 0 is the pre-`user_version`
+/// baseline; applying the idempotent DDL brings it to version 1.
+fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+    let mut version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    if version > SCHEMA_VERSION {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+            Some(format!(
+                "database schema version {version} is newer than supported version {SCHEMA_VERSION}"
+            )),
+        ));
+    }
+    // One block per version step. Keep each step idempotent: databases created
+    // before versioning report 0 even though the baseline objects exist.
+    if version < 1 {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(SCHEMA)?;
+        tx.pragma_update(None, "user_version", 1)?;
+        tx.commit()?;
+        version = 1;
+    }
+    debug_assert_eq!(version, SCHEMA_VERSION, "missing migration step");
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -119,11 +198,19 @@ pub fn insert_batch(conn: &Connection, entries: &[Entry]) -> rusqlite::Result<us
         }
     }
     tx.commit()?;
+    // The -wal/-shm sidecars are (re)created lazily by the first write.
+    if let Some(path) = conn.path().filter(|p| !p.is_empty()) {
+        secure_db_files(std::path::Path::new(path));
+    }
     Ok(entries.len())
 }
 
 /// Trigram FTS5 needs at least one three-character run; shorter queries use LIKE.
 const FTS_MIN_CHARS: usize = 3;
+
+/// Hard cap for search results. SQLite treats a negative LIMIT as "no limit",
+/// so clamp before binding; 10k is far above any interactive use.
+const SEARCH_MAX_LIMIT: i64 = 10_000;
 
 fn use_fts(query: &str) -> bool {
     query.chars().count() >= FTS_MIN_CHARS && !query.trim().is_empty()
@@ -157,10 +244,33 @@ fn escape_like(s: &str) -> String {
     out
 }
 
+/// Normalize a `--dir` value: strip trailing slashes, keep `/` as root, and
+/// treat an empty value as no filter.
+fn normalize_dir(dir: &str) -> &str {
+    let trimmed = dir.trim_end_matches('/');
+    if trimmed.is_empty() && dir.starts_with('/') {
+        "/"
+    } else {
+        trimmed
+    }
+}
+
+/// Bounds for the cwd subtree of `dir`: `[dir + "/", dir + "0")`, plus the
+/// exact `dir` equality at the call site. Comparing raw strings avoids LIKE
+/// wildcard escaping and still lets SQLite use `idx_cwd` via a multi-index OR.
+fn dir_bounds(dir: &str) -> (String, String) {
+    let base = normalize_dir(dir);
+    if base == "/" {
+        ("/".to_string(), "0".to_string())
+    } else {
+        (format!("{base}/"), format!("{base}0"))
+    }
+}
+
 /// Frecency-ish search. FTS5 trigram phrase when the query is matchable,
 /// LIKE fallback for 1-2 character queries (trigrams cannot match those).
-/// Filters: cwd, exit ("0" | "!0"), session, host, since (unix nanoseconds;
-/// `cmd_search` converts user-facing seconds).
+/// Filters: cwd subtree (`--dir` includes descendants), exit ("0" | "!0"),
+/// session, host, since (unix nanoseconds; `cmd_search` converts seconds).
 pub fn search_sql(
     query: &str,
     dir: Option<&str>,
@@ -169,6 +279,7 @@ pub fn search_sql(
     host: Option<&str>,
     since: Option<i64>,
 ) -> String {
+    let dir = dir.map(normalize_dir).filter(|d| !d.is_empty());
     let exit_clause = match exit_filter {
         Some("0") => "AND h.exit_code = 0",
         Some("!0") => "AND h.exit_code != 0",
@@ -192,7 +303,7 @@ pub fn search_sql(
         sql.push_str("AND ?1 IS NULL ");
     }
     if dir.is_some() {
-        sql.push_str("AND h.cwd = ?2 ");
+        sql.push_str("AND (h.cwd = ?2 OR (h.cwd >= ?7 AND h.cwd < ?8)) ");
     } else {
         sql.push_str("AND ?2 IS NULL ");
     }
@@ -226,8 +337,9 @@ pub fn search(
     host: Option<&str>,
     since: Option<i64>,
 ) -> rusqlite::Result<Vec<(i64, i64, String, String)>> {
+    let dir = dir.map(normalize_dir).filter(|d| !d.is_empty());
+    let limit = limit.clamp(0, SEARCH_MAX_LIMIT);
     let sql = search_sql(query, dir, exit_filter, session, host, since);
-    let mut stmt = conn.prepare(&sql)?;
     let bind_q: Option<String> = if use_fts(query) {
         Some(fts_phrase(query))
     } else if query.is_empty() {
@@ -235,10 +347,16 @@ pub fn search(
     } else {
         Some(escape_like(query))
     };
-    let rows = stmt.query_map(
-        params![bind_q.as_deref(), dir, session, host, since, limit],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-    )?;
+    let bounds = dir.map(dir_bounds);
+    let mut stmt = conn.prepare(&sql)?;
+    let mut binds: Vec<&dyn rusqlite::ToSql> = vec![&bind_q, &dir, &session, &host, &since, &limit];
+    if let Some((ref lower, ref upper)) = bounds {
+        binds.push(lower);
+        binds.push(upper);
+    }
+    let rows = stmt.query_map(params_from_iter(binds), |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+    })?;
     rows.collect()
 }
 
@@ -288,20 +406,34 @@ pub fn suggest(
     limit: i64,
 ) -> rusqlite::Result<Vec<String>> {
     // Weight: same-dir hits dominate, frequency follows, recency breaks ties.
-    // Over-fetch: control-tainted rows are filtered in Rust below.
+    // Control-tainted rows are filtered in Rust; if they crowd out clean
+    // candidates, widen the over-fetch until enough clean rows are seen or the
+    // prefix is exhausted. Write-time sanitization keeps new rows clean, so the
+    // common case still costs one query.
     let limit = limit.clamp(0, 1000);
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
     let pattern = format!("{}%", escape_like(buffer));
     let mut stmt = conn.prepare(SUGGEST_SQL)?;
-    let rows = stmt.query_map(
-        params![pattern, cwd, limit.saturating_add(16), buffer],
-        |r| r.get::<_, String>(0),
-    )?;
-    Ok(rows
-        .collect::<rusqlite::Result<Vec<_>>>()?
-        .into_iter()
-        .filter(|c| !c.chars().any(|ch| ch.is_control()))
-        .take(limit as usize)
-        .collect())
+    let mut fetch = limit.saturating_add(16);
+    loop {
+        let raw: Vec<String> = stmt
+            .query_map(params![pattern, cwd, fetch, buffer], |r| {
+                r.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let exhausted = (raw.len() as i64) < fetch;
+        let clean: Vec<String> = raw
+            .into_iter()
+            .filter(|c| !c.chars().any(|ch| ch.is_control()))
+            .take(limit as usize)
+            .collect();
+        if clean.len() as i64 >= limit || exhausted {
+            return Ok(clean);
+        }
+        fetch = fetch.saturating_mul(2);
+    }
 }
 
 /// Representative suggest plan for CI gate output (shape mirrors suggest()).

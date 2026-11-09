@@ -299,4 +299,116 @@ mod integration {
             "plan did not use idx_cmd:\n{plan}"
         );
     }
+
+    #[test]
+    fn search_dir_matches_subtree() {
+        let conn = memdb();
+        db::insert(&conn, &entry("make", "/repo", 0, 100)).unwrap();
+        db::insert(&conn, &entry("make", "/repo/sub", 0, 101)).unwrap();
+        db::insert(&conn, &entry("make", "/repository", 0, 102)).unwrap();
+        db::insert(&conn, &entry("make", "/other", 0, 103)).unwrap();
+        let rows = db::search(&conn, "make", 10, Some("/repo"), None, None, None, None).unwrap();
+        assert_eq!(rows.len(), 2);
+        let rows = db::search(&conn, "make", 10, Some("/repo/"), None, None, None, None).unwrap();
+        assert_eq!(rows.len(), 2);
+        let rows = db::search(&conn, "make", 10, Some("/"), None, None, None, None).unwrap();
+        assert_eq!(rows.len(), 4);
+    }
+
+    #[test]
+    fn search_negative_limit_returns_nothing() {
+        let conn = memdb();
+        db::insert(&conn, &entry("git status", "/r", 0, 100)).unwrap();
+        let rows = db::search(&conn, "", -1, None, None, None, None, None).unwrap();
+        assert!(rows.is_empty());
+        let rows = db::search(&conn, "git", 0, None, None, None, None, None).unwrap();
+        assert!(rows.is_empty());
+        let rows = db::search(&conn, "git", i64::MAX, None, None, None, None, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        let cands = db::suggest(&conn, "git", "/r", i64::MAX).unwrap();
+        assert_eq!(cands, vec!["git status"]);
+    }
+
+    #[test]
+    fn suggest_survives_control_starvation() {
+        let conn = memdb();
+        for i in 0..3 {
+            db::insert(&conn, &entry(&format!("bad clean {i}"), "/r", 0, 100 + i)).unwrap();
+        }
+        for i in 0..25 {
+            db::insert(&conn, &entry(&format!("bad\x1b[7m{i}"), "/r", 0, 200 + i)).unwrap();
+        }
+        let cands = db::suggest(&conn, "bad", "/r", 3).unwrap();
+        assert_eq!(cands, vec!["bad clean 2", "bad clean 1", "bad clean 0"]);
+    }
+
+    #[test]
+    fn open_migrates_schema_and_preserves_rows() {
+        let dir = std::env::temp_dir().join(format!("gl-migrate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.db");
+        {
+            let conn = db::open(&path).unwrap();
+            db::insert(&conn, &entry("git status", "/r", 0, 100)).unwrap();
+            // Simulate a database created before versioning: no idx_cmd and
+            // user_version left at 0.
+            conn.execute_batch("DROP INDEX idx_cmd;").unwrap();
+            conn.pragma_update(None, "user_version", 0).unwrap();
+        }
+        let conn = db::open(&path).unwrap();
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, db::SCHEMA_VERSION);
+        let objs = db::schema_objects(&conn).unwrap();
+        assert!(objs.iter().any(|o| o == "idx_cmd"));
+        let rows = db::search(&conn, "status", 10, None, None, None, None, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        drop(conn);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn open_rejects_newer_schema_version() {
+        let dir = std::env::temp_dir().join(format!("gl-newer-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.db");
+        {
+            let conn = db::open(&path).unwrap();
+            conn.pragma_update(None, "user_version", db::SCHEMA_VERSION + 1)
+                .unwrap();
+        }
+        assert!(db::open(&path).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_makes_db_and_sidecars_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = std::env::temp_dir().join(format!("gl-perm-{}", std::process::id()));
+        std::fs::remove_dir_all(&base).ok();
+        let dbp = base.join("nested").join("ghostline").join("history.db");
+        let conn = db::open(&dbp).unwrap();
+        db::insert(&conn, &entry("git status", "/r", 0, 100)).unwrap();
+
+        let parent = dbp.parent().unwrap();
+        assert_eq!(
+            std::fs::metadata(parent).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let mut files = vec![dbp.clone()];
+        for suffix in ["-wal", "-shm"] {
+            let mut p = dbp.as_os_str().to_owned();
+            p.push(suffix);
+            files.push(std::path::PathBuf::from(p));
+        }
+        for p in files {
+            let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{} has mode {mode:o}", p.display());
+        }
+        drop(conn);
+        std::fs::remove_dir_all(&base).ok();
+    }
 }

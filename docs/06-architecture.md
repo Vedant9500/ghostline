@@ -71,7 +71,7 @@ CREATE TABLE sync_state(
 );
 ```
 
-Notes: cap `cmd` ~8KB (overflow → blob table or `truncated=1`); never store `env` wholesale (hashed allowlist only); UUIDv7 + `(started_at, device_id)` = merge order without server.
+Notes: cap `cmd` ~8KB (overflow → blob table or `truncated=1`); never store `env` wholesale (hashed allowlist only); UUIDv7 + `(started_at, device_id)` = merge order without server. Schema version is stored in `PRAGMA user_version` (currently 1); `db::open` applies the baseline DDL only when upgrading and refuses databases written by a newer version.
 
 ## Shell integration
 

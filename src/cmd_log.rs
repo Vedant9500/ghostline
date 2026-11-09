@@ -62,6 +62,7 @@ pub fn build_entry(
             shell.to_string()
         },
         sensitive,
+        import_key: None,
     })
 }
 

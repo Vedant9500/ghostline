@@ -27,7 +27,8 @@
 
 ### F5. `ghostline search` (history UI)
 - FTS5 trigram + filters: `--dir` (subtree), `--host`, `--session`, `--exit N/!N`, `--since UNIX_SECS`, `--limit`.
-- fzf/skim binding (`Ctrl-R` opt-in, never hijack `↑` by default). `F2`/flag to delete entry. Import: `ghostline import --from histfile`.
+- Ranking: exact matches first, then prefixes, exact-cwd affinity, and recency. Reads use a read-only connection with a short busy timeout and never create an empty DB.
+- fzf/skim binding (`Ctrl-R` opt-in, never hijack `↑` by default). `F2`/flag to delete entry. Import: `ghostline import --from histfile` (repeat imports dedupe).
 
 ### F6. Privacy + safety rails
 - Redact before persist + before any cloud send; `sensitive=1` flag; `GHOSTLINE_IGNORE` glob deny-list; `ghostline redact --pattern`.
@@ -41,7 +42,7 @@
 - **F10. Stats/insights:** `ghostline stats [--by dir|cmd|hour]` — top cmds, failure rate, slowest, time-of-day. Weekly digest opt-in.
 - **F11. NL-rules baseline (ON HOLD for anything model-based):** rules (top-100 intents) + bundled tldr only. Local GGUF model is parked — breaks the lightweight budget. See `09-roadmap.md`.
 - **F12. Daemon + queue:** `O_APPEND` queue + `ghostline daemon` batching (500 rows/1s), FTS indexing off hot path, systemd/launchd user agent.
-- **F13. Delete/redact tooling:** `ghostline forget <pattern>`, `ghostline forget --last-n`, per-project `.ghostlineignore`.
+- **F13. Delete/redact tooling:** `ghostline forget <pattern>`, `--last-n`, `--older-than`, `--max-rows`, `--dry-run`, and `--vacuum`; new databases use incremental auto-vacuum. Per-project `.ghostlineignore` remains future work.
 
 ## P2 — later / brainstormed extras
 

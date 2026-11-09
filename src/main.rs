@@ -1,5 +1,6 @@
 mod cmd_bench;
 mod cmd_daemon;
+mod cmd_forget;
 mod complete;
 mod cmd_fix;
 mod cmd_import;
@@ -22,6 +23,7 @@ Usage:
   ghostline log [flags] <command...>  log one command (or --queue for queue-append)
   ghostline daemon [--once]           drain queue into SQLite (or run loop)
   ghostline import [--from HISTFILE]  bulk-import shell history
+  ghostline forget [flags] [PATTERN...] delete history rows (or preview with --dry-run)
   ghostline fix [--last] [command...]  did-you-mean repair (exit 0 = found)
   ghostline search [flags] [query]    search history (tab-separated: ts, exit, cwd, cmd)
   ghostline suggest [flags] <buffer>  print ghost suffix for buffer (or --all for full cmds)
@@ -29,6 +31,8 @@ Usage:
 
 log flags:     --shell S --cwd DIR --exit CODE --session ID [--db PATH] [--queue] [--queue-dir D]
 daemon flags:  [--once] [--interval-ms N] [--queue-dir D] [--db PATH]
+import flags:  [--from HISTFILE] [--db PATH] [--shell S] [--no-dedupe]
+forget flags:  [--db P] [--dry-run] [--vacuum] [--last-n N | --older-than DAYS | --max-rows N | --all | PATTERN...]
 fix flags:     [--last] [--exit CODE] [--cwd DIR] [--db P] [-q]
 search flags:  [--limit N] [--dir DIR] [--exit N|!N] [--session S] [--host H] [--since UNIX_SECS] [--db PATH]
 suggest flags: [--cwd DIR] [--limit N] [--all] [--db PATH]
@@ -81,6 +85,13 @@ fn main() {
             }
         },
         "import" => match cmd_import::run(rest) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("error: {e}");
+                1
+            }
+        },
+        "forget" => match cmd_forget::run(rest) {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("error: {e}");
@@ -147,6 +158,7 @@ mod integration {
             session_id: "s".into(),
             shell: "bash".into(),
             sensitive: false,
+            import_key: None,
         }
     }
 
@@ -511,6 +523,309 @@ mod integration {
             db::path_from_env(Some(OsString::from("/tmp/base"))),
             Some(std::path::PathBuf::from("/tmp/base"))
         );
+    }
+
+    #[test]
+    fn open_read_missing_db_returns_none_without_creating() {
+        let dir = std::env::temp_dir().join(format!("gl-ro-missing-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.db");
+        assert!(db::open_read(&path).unwrap().is_none());
+        assert!(!path.exists(), "read path must not create an empty database");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn open_read_is_read_only_with_short_timeout() {
+        let dir = std::env::temp_dir().join(format!("gl-ro-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.db");
+        {
+            let conn = db::open(&path).unwrap();
+            db::insert(&conn, &entry("git status", "/r", 0, 100)).unwrap();
+        }
+        let conn = db::open_read(&path).unwrap().expect("existing db opens");
+        let timeout: i64 = conn
+            .pragma_query_value(None, "busy_timeout", |r| r.get(0))
+            .unwrap();
+        assert_eq!(timeout, 100);
+        let query_only: i64 = conn
+            .pragma_query_value(None, "query_only", |r| r.get(0))
+            .unwrap();
+        assert_eq!(query_only, 1);
+        assert!(
+            conn.execute(
+                "INSERT INTO history(id,cmd,cwd,exit_code,started_at,ended_at)
+                 VALUES('x','x','x',0,0,0)",
+                []
+            )
+            .is_err(),
+            "read-only connection must reject writes"
+        );
+        let rows = db::search(&conn, "status", 10, None, None, None, None, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        drop(conn);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn batch_insert_takes_write_lock_before_first_row() {
+        let dir = std::env::temp_dir().join(format!("gl-immediate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.db");
+        let writer = db::open(&path).unwrap();
+        let other = db::open(&path).unwrap();
+        other
+            .busy_timeout(std::time::Duration::from_millis(20))
+            .unwrap();
+        let tx = db::begin_write(&writer).unwrap();
+        // BEGIN IMMEDIATE holds the write lock even though no row was written;
+        // a deferred transaction would let this insert through until commit.
+        let err = db::insert(&other, &entry("blocked", "/r", 0, 1)).unwrap_err();
+        assert!(
+            matches!(err, rusqlite::Error::SqliteFailure(e, _) if e.code == rusqlite::ErrorCode::DatabaseBusy),
+            "expected BUSY, got {err:?}"
+        );
+        tx.commit().unwrap();
+        db::insert(&other, &entry("after commit", "/r", 0, 2)).unwrap();
+        drop(writer);
+        drop(other);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn auto_vacuum_is_incremental_on_new_databases() {
+        let dir = std::env::temp_dir().join(format!("gl-av-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = db::open(&dir.join("history.db")).unwrap();
+        let mode: i64 = conn
+            .pragma_query_value(None, "auto_vacuum", |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, 2, "new databases should use incremental auto-vacuum");
+        drop(conn);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn search_ranks_exact_then_prefix_then_substring() {
+        let conn = memdb();
+        db::insert(&conn, &entry("git", "/r", 0, 100)).unwrap();
+        db::insert(&conn, &entry("git status", "/r", 0, 200)).unwrap();
+        db::insert(&conn, &entry("run git", "/r", 0, 300)).unwrap();
+        let rows = db::search(&conn, "git", 10, None, None, None, None, None).unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.3.as_str()).collect::<Vec<_>>(),
+            vec!["git", "git status", "run git"]
+        );
+    }
+
+    #[test]
+    fn suggest_decays_stale_frequency() {
+        let conn = memdb();
+        let day = 86_400_000_000_000i64;
+        let now = 1_000 * day;
+        for i in 0..100 {
+            db::insert(&conn, &entry("deploy legacy", "/other", 0, i)).unwrap();
+        }
+        for i in 0..10 {
+            db::insert(&conn, &entry("deploy current", "/repo", 0, now - day + i)).unwrap();
+        }
+        let cands = db::suggest_at(&conn, "deploy", "/repo", 5, now).unwrap();
+        assert_eq!(cands[0], "deploy current");
+    }
+
+    #[test]
+    fn suggest_prefers_recent_use_over_stale_frequency() {
+        let conn = memdb();
+        let day = 86_400_000_000_000i64;
+        let now = 1_000 * day;
+        for i in 0..10 {
+            db::insert(&conn, &entry("deploy old", "/other", 0, now - 100 * day + i)).unwrap();
+        }
+        db::insert(&conn, &entry("deploy recent", "/other", 0, now - day)).unwrap();
+        let cands = db::suggest_at(&conn, "deploy", "/repo", 5, now).unwrap();
+        assert_eq!(cands[0], "deploy recent");
+    }
+
+    #[test]
+    fn forget_pattern_deletes_and_syncs_fts() {
+        let conn = memdb();
+        db::insert(&conn, &entry("git status", "/r", 0, 100)).unwrap();
+        db::insert(&conn, &entry("cargo test", "/r", 0, 200)).unwrap();
+        db::insert(&conn, &entry("git log", "/r", 0, 300)).unwrap();
+        let patterns = vec!["git".to_string()];
+        let report = db::forget(&conn, &db::ForgetMode::Patterns(&patterns), false).unwrap();
+        assert_eq!((report.matched, report.deleted), (2, 2));
+        assert!(db::search(&conn, "git", 10, None, None, None, None, None)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            db::search(&conn, "cargo", 10, None, None, None, None, None)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn forget_last_n_and_max_rows_are_opposites() {
+        let conn = memdb();
+        db::insert(&conn, &entry("first", "/r", 0, 100)).unwrap();
+        db::insert(&conn, &entry("second", "/r", 0, 200)).unwrap();
+        db::insert(&conn, &entry("third", "/r", 0, 300)).unwrap();
+        let report = db::forget(&conn, &db::ForgetMode::LastN(2), false).unwrap();
+        assert_eq!(report.deleted, 2);
+        let rows = db::search(&conn, "", 10, None, None, None, None, None).unwrap();
+        assert_eq!(rows.iter().map(|r| r.3.as_str()).collect::<Vec<_>>(), vec!["first"]);
+
+        let report = db::forget(&conn, &db::ForgetMode::MaxRows(0), false).unwrap();
+        assert_eq!(report.deleted, 1);
+        assert!(db::search(&conn, "", 10, None, None, None, None, None)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn forget_pattern_treats_wildcards_literally() {
+        let conn = memdb();
+        db::insert(&conn, &entry("echo 100% done", "/r", 0, 100)).unwrap();
+        db::insert(&conn, &entry("echo 100x done", "/r", 0, 200)).unwrap();
+        let patterns = vec!["100%".to_string()];
+        let report = db::forget(&conn, &db::ForgetMode::Patterns(&patterns), false).unwrap();
+        assert_eq!(report.deleted, 1);
+        let rows = db::search(&conn, "100", 10, None, None, None, None, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].3, "echo 100x done");
+    }
+
+    #[test]
+    fn forget_older_than_days_uses_a_cutoff() {
+        let conn = memdb();
+        db::insert(&conn, &entry("very old", "/r", 0, 0)).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        db::insert(&conn, &entry("fresh", "/r", 0, now)).unwrap();
+        let report = db::forget(&conn, &db::ForgetMode::OlderThanDays(1), false).unwrap();
+        assert_eq!(report.deleted, 1);
+        let rows = db::search(&conn, "", 10, None, None, None, None, None).unwrap();
+        assert_eq!(rows.iter().map(|r| r.3.as_str()).collect::<Vec<_>>(), vec!["fresh"]);
+    }
+
+    #[test]
+    fn forget_dry_run_reports_without_deleting() {
+        let conn = memdb();
+        db::insert(&conn, &entry("git status", "/r", 0, 100)).unwrap();
+        db::insert(&conn, &entry("git log", "/r", 0, 200)).unwrap();
+        let patterns = vec!["git".to_string()];
+        let report = db::forget(&conn, &db::ForgetMode::Patterns(&patterns), true).unwrap();
+        assert_eq!((report.matched, report.deleted), (2, 0));
+        assert_eq!(report.rows.len(), 2);
+        assert_eq!(
+            db::search(&conn, "git", 10, None, None, None, None, None)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn forget_rejects_multiple_selectors() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(crate::cmd_forget::run(&args(&["--last-n", "1", "--all"])).is_err());
+        assert!(crate::cmd_forget::run(&args(&["--older-than", "-1"])).is_err());
+        assert!(crate::cmd_forget::run(&args(&["--max-rows", "x"])).is_err());
+    }
+
+    #[test]
+    fn import_dedupes_reimported_histfile() {
+        let dir = std::env::temp_dir().join(format!("gl-import-dedupe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let hist = dir.join("history.txt");
+        std::fs::write(&hist, "git status\ncargo test\n").unwrap();
+        let dbp = dir.join("history.db");
+        let args = |extra: &[&str]| {
+            let mut v = vec![
+                "--from".to_string(),
+                hist.to_str().unwrap().to_string(),
+                "--db".to_string(),
+                dbp.to_str().unwrap().to_string(),
+            ];
+            v.extend(extra.iter().map(|s| s.to_string()));
+            v
+        };
+        crate::cmd_import::run(&args(&[])).unwrap();
+        crate::cmd_import::run(&args(&[])).unwrap();
+        {
+            let conn = db::open(&dbp).unwrap();
+            let count: i64 = conn
+                .query_row("SELECT count(*) FROM history", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, 2, "second import must skip duplicates");
+        }
+        crate::cmd_import::run(&args(&["--no-dedupe"])).unwrap();
+        let conn = db::open(&dbp).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM history", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 4, "--no-dedupe must force a fresh copy");
+        drop(conn);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migration_v2_adds_import_key_index() {
+        let dir = std::env::temp_dir().join(format!("gl-migrate3-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.db");
+        {
+            let conn = db::open(&path).unwrap();
+            conn.execute_batch(
+                "DROP INDEX idx_import_key;
+                 ALTER TABLE history DROP COLUMN import_key;",
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 2).unwrap();
+        }
+        let conn = db::open(&path).unwrap();
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, db::SCHEMA_VERSION);
+        let index: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='idx_import_key'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(index, 1);
+        let column: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('history') WHERE name='import_key'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(column, 1);
+        drop(conn);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn search_missing_db_does_not_create_one() {
+        let dir = std::env::temp_dir().join(format!("gl-search-nocreate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.db");
+        let args = vec![
+            "--db".to_string(),
+            path.to_str().unwrap().to_string(),
+            "anything".to_string(),
+        ];
+        crate::cmd_search::run(&args).unwrap();
+        assert!(!path.exists());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[cfg(unix)]

@@ -92,6 +92,7 @@ fn bench_entry(i: usize) -> db::Entry {
         session_id: "bench".into(),
         shell: "bash".into(),
         sensitive: false,
+        import_key: None,
     }
 }
 

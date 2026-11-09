@@ -23,6 +23,7 @@ Rejected for v1 primary: append-JSONL alone (fast `O_APPEND` 0.05ms but O(n) sca
 ### Schema (canonical)
 
 ```sql
+PRAGMA auto_vacuum=INCREMENTAL;
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
 PRAGMA busy_timeout=5000;
@@ -48,7 +49,8 @@ CREATE TABLE history(
   git_branch TEXT,
   nix_ctx TEXT,
   sensitive INTEGER NOT NULL DEFAULT 0,
-  created_seq INTEGER           -- lamport clock for sync tiebreak
+  created_seq INTEGER,          -- lamport clock for sync tiebreak
+  import_key TEXT               -- stable key for idempotent HISTFILE imports
 ) STRICT;
 CREATE INDEX idx_time ON history(started_at DESC);
 CREATE INDEX idx_cwd ON history(cwd, started_at DESC);
@@ -57,6 +59,8 @@ CREATE INDEX idx_host_session ON history(hostname, session_id);
 -- Covering partial index for per-keystroke ghost suggestions.
 CREATE INDEX idx_cmd ON history(cmd COLLATE NOCASE, cwd, started_at DESC)
   WHERE exit_code = 0 AND sensitive = 0;
+CREATE UNIQUE INDEX idx_import_key ON history(import_key)
+  WHERE import_key IS NOT NULL;
 
 CREATE VIRTUAL TABLE history_fts USING fts5(cmd, cwd, tokenize='trigram');
 CREATE TRIGGER history_ai AFTER INSERT ON history BEGIN
@@ -81,7 +85,11 @@ CREATE TABLE sync_state(
 );
 ```
 
-Notes: cap `cmd` ~8KB (overflow → blob table or `truncated=1`); never store `env` wholesale (hashed allowlist only); UUIDv7 + `(started_at, device_id)` = merge order without server. Schema version is stored in `PRAGMA user_version` (currently 2); `db::open` applies the baseline DDL and versioned steps only when upgrading and refuses databases written by a newer version. `ghostline import` runs `ANALYZE` after bulk loads, and the daemon runs `PRAGMA optimize` after each batch.
+Notes: cap `cmd` ~8KB (overflow → blob table or `truncated=1`); never store `env` wholesale (hashed allowlist only); UUIDv7 + `(started_at, device_id)` = merge order without server. Schema version is stored in `PRAGMA user_version` (currently 3); `db::open` applies the baseline DDL and versioned steps only when upgrading and refuses databases written by a newer version. `ghostline import` runs `ANALYZE` after bulk loads, and the daemon runs `PRAGMA optimize` after each batch.
+
+Read paths (`search`, `suggest`, `fix`) use `open_read`: a read-only connection, `PRAGMA query_only`, and a 100 ms busy timeout. A current `user_version` skips all DDL; an older database falls back to the writable migration path. A missing database returns no rows instead of creating an empty file.
+
+Batch inserts use `BEGIN IMMEDIATE` so writers queue on the RESERVED lock instead of both reading and then fighting over the upgrade. Suggestion weights decay by age (4/14/90-day buckets), and search orders exact matches, prefixes, exact-cwd affinity, then recency. `forget` deletes rows (FTS triggers follow) and runs `PRAGMA incremental_vacuum`, or a full `VACUUM` with `--vacuum`.
 
 ## Shell integration
 

@@ -10,7 +10,9 @@ fork+exec ghostline-log (static musl):             ~0.8–1.5ms
   sqlite open + 1 INSERT WAL/NORMAL:           ~0.3–1.0ms
   close+exit:                                  ~0.10ms
 prompt render delta vs baseline:               ≤2ms total (p99 <5ms)
-query 20 results, FTS, 500k rows:              ≤50ms
+query 20 results, FTS, 500k rows:              ≤50ms (rare terms and misses; common
+                                               tokens cost more when ranked)
+read-path lock wait (`search`/`suggest`):      ≤100ms busy timeout
 daemon batch 500 rows:                         ≤100ms background, 0ms foreground
 ```
 

@@ -32,7 +32,7 @@
 | 19 | Low | No deterministic tie-break in `search`/`suggest` ordering | 165, 211 |
 | 20 | Low | Imports with no timestamps share one `started_at`, so ties are arbitrary | `cmd_import.rs:14` |
 
-> **Status (2026-11-09):** all findings 1–20 are fixed in the working tree. See [Resolution log](#resolution-log-2026-11-09).
+> **Status (2026-11-09):** all findings 1–20 are fixed. Golden opportunities 2, 3, 4, 5, 9, and 12 are also implemented. See [Resolution log](#resolution-log-2026-11-09) and [Golden opportunities follow-up](#golden-opportunities-follow-up-2026-11-09).
 
 ---
 
@@ -406,3 +406,16 @@ Tests added: `since_to_ns` unit tests, `ghost_suffix` case/boundary tests, sensi
 The v1→v2 migration test simulates an old database with the broken `'delete'` trigger, then verifies the repaired trigger and the new update trigger both work.
 
 For finding 9, a SQL-level `cmd NOT GLOB '*[control]*'` filter was measured but added ~30 ms to a common-prefix suggest at 500k rows (about 20 ms -> 53 ms). Adaptive over-fetch plus write-time sanitization keeps the common case at ~25 ms while still guaranteeing clean candidates from legacy databases.
+
+## Golden opportunities follow-up (2026-11-09)
+
+| Opportunity | Status | Change |
+|---|---|---|
+| 2. Real frecency | Implemented | Suggestion runs are weighted by age buckets (4/14/90 days), so stale frequency decays instead of dominating recent local use. `suggest_at` takes an explicit clock for deterministic tests. |
+| 3. Search ranking | Implemented | `search` orders exact matches, then prefixes, exact-cwd affinity, and recency. bm25 was measured and omitted: on 500k rows it added roughly 40 ms to a common-token search. |
+| 4. Import dedupe | Implemented | Schema v3 adds a nullable `import_key` with a partial unique index. Import keys cover source path, line number, timestamp, and command, so re-importing the same HISTFILE skips already-present rows; `--no-dedupe` opts out. |
+| 5. Retention and vacuum | Implemented | `ghostline forget` supports patterns, `--last-n`, `--older-than`, `--max-rows`, `--all`, `--dry-run`, and `--vacuum`. New databases use `auto_vacuum=INCREMENTAL`; deletes keep FTS in sync. |
+| 9. Read-only hot path | Implemented | `open_read` uses `SQLITE_OPEN_READ_ONLY`, `query_only`, and a 100 ms busy timeout. Current schemas skip DDL; missing databases return no rows instead of creating a file. `search`, `suggest`, and `fix` use it. |
+| 12. `BEGIN IMMEDIATE` | Implemented | Batch inserts start with `BEGIN IMMEDIATE`, so writers take the RESERVED lock up front instead of racing a deferred lock upgrade. |
+
+Still open from the review's non-numbered list: precomputed suggestion aggregates (#1), UUID BLOB storage (#8), external-content FTS (#11), destructive-command suppression, the 500k-row CI query job, and the short-query LIKE fallback cost.

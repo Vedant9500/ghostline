@@ -14,11 +14,11 @@ It is for people who want faster history recall and inline correction without a 
 - Hooks come from `ghostline init bash|zsh|fish`. Bash uses `PROMPT_COMMAND` plus `history 1`; zsh uses `preexec`/`precmd`; fish uses `fish_postexec`.
 - Storage is SQLite in WAL mode with a `history` table, time/cwd/session/prefix indexes, and an FTS5 virtual table with insert/update/delete triggers. The database, its WAL/SHM sidecars, and the `ghostline` data directory are private (`0600`/`0700`).
 - An optional JSONL ingest queue (`log --queue` or `GHOSTLINE_QUEUE=1`) is drained by `ghostline daemon` in batches of 500 rows.
-- `ghostline import` reads a bash-style `HISTFILE`, including `#<unix-seconds>` timestamps.
+- `ghostline import` reads a bash-style `HISTFILE`, including `#<unix-seconds>` timestamps. Re-importing the same file is idempotent via a stable per-line key; `--no-dedupe` forces a fresh copy.
 
 **Ghost suggestions (bash)**
 
-- History suggestions are prefix matches ranked by exact-cwd affinity, frequency, and recency. Only successful, non-sensitive commands are candidates, and candidates containing control characters are dropped.
+- History suggestions are prefix matches ranked by exact-cwd affinity and age-decayed frecency: a run in the last four days counts as a full use, older runs decay through 14- and 90-day buckets. Only successful, non-sensitive commands are candidates, and candidates containing control characters are dropped.
 - When no history matches and the buffer is one token, lookup falls back to executable names on `PATH` plus shell builtins.
 - The default bash hook paints an on-demand dim suffix. `Ctrl-G` previews, `Right`/`Ctrl-F`/`End` accept at end of line, `Alt-Right`/`Alt-F` accept one word, and `Ctrl-]` dismisses.
 - The optional loadable bash builtin (`builtin/ghostline_autosuggest.c`) hooks readline's redisplay and paints the suffix automatically on every keypress without a full-line refresh.
@@ -31,7 +31,9 @@ It is for people who want faster history recall and inline correction without a 
 
 **Search and diagnostics**
 
-- `ghostline search` uses FTS5 trigram phrase matching for queries of at least three characters, with a `LIKE` fallback for shorter queries. Filters cover cwd (including subdirectories), exit status (`N` or `!N`), session, host, and timestamp. Output is tab-separated: timestamp (Unix ns), exit code, cwd, command.
+- `ghostline search` uses FTS5 trigram phrase matching for queries of at least three characters, with a `LIKE` fallback for shorter queries. Results rank exact matches first, then prefix matches, exact-cwd affinity, and recency. Filters cover cwd (including subdirectories), exit status (`N` or `!N`), session, host, and timestamp. Output is tab-separated: timestamp (Unix ns), exit code, cwd, command.
+- `search`, `suggest`, and `fix` open an existing database read-only with a 100 ms busy timeout; they skip schema work and never create an empty database just because a read ran.
+- `ghostline forget` deletes by pattern, newest N (`--last-n`), age (`--older-than DAYS`), or keeps only the newest N (`--max-rows`); `--dry-run` previews and `--vacuum` reclaims space. New databases use incremental auto-vacuum.
 - No fzf/skim binding or `Ctrl-R` hijack is installed.
 - `ghostline bench` reports log/search/suggest/hook percentiles, inserts per second, BUSY count, WAL and DB sizes, binary size, RSS, and schema presence. `--gate` exits non-zero when a budget is exceeded or a query plan loses its FTS/index path; `--json` emits a machine-readable report.
 
@@ -39,7 +41,7 @@ It is for people who want faster history recall and inline correction without a 
 
 - Fuzzy history matching, fzf/skim integration, opt-in `Ctrl-R` search, and zsh/fish ghost painting.
 - tldr templates, `explain`, NL-to-command, local models, and cloud fallback.
-- Destructive-command tiers, undo guard, typed confirmation flows, `stats`, `forget`, `why`, `replay`, sanitized export, team cheatsheets, and multi-machine sync.
+- Destructive-command tiers, undo guard, typed confirmation flows, `stats`, `why`, `replay`, sanitized export, team cheatsheets, and multi-machine sync.
 - Next-command prediction, project-aware habit ranking, the alias advisor, daemon service units, socket transport, and an installed `gl` alias.
 
 See [docs/09-roadmap.md](docs/09-roadmap.md) for the planned slices and parked work.
@@ -110,7 +112,8 @@ With the shell ghost, `Ctrl-G` previews; `Right`/`Ctrl-F`/`End` accept at end of
 | `ghostline init SHELL` | Print the hook for `bash`, `zsh`, or `fish` | none |
 | `ghostline log [flags] <command...>` | Log one command | `--shell S`, `--cwd DIR`, `--exit CODE`, `--session ID`, `--db PATH`, `--queue`, `--queue-dir D` |
 | `ghostline daemon [--once]` | Drain the queue once or in a loop | `--once`, `--interval-ms N`, `--queue-dir D`, `--db PATH` |
-| `ghostline import [--from HISTFILE]` | Bulk-import a bash history file | `--from HISTFILE` |
+| `ghostline import [--from HISTFILE]` | Bulk-import a bash history file; repeat runs dedupe | `--from HISTFILE`, `--shell S`, `--no-dedupe`, `--db PATH` |
+| `ghostline forget [flags] [PATTERN...]` | Delete matching history; preview with `--dry-run` | `--last-n N`, `--older-than DAYS`, `--max-rows N`, `--all`, `--dry-run`, `--vacuum`, `--db PATH` |
 | `ghostline fix [--last] [command...]` | Print `did you mean` candidates; exit 0 when found | `--last`, `--exit CODE`, `--cwd DIR`, `--db PATH`, `-q` |
 | `ghostline search [flags] [query]` | Search history and print TSV rows | `--limit N`, `--dir DIR`, `--exit N` or `!N`, `--session S`, `--host H`, `--since UNIX_SECS`, `--db PATH` |
 | `ghostline suggest [flags] <buffer>` | Print the next ghost suffix, or full commands with `--all` | `--cwd DIR`, `--limit N`, `--all`, `--db PATH` |
@@ -145,7 +148,7 @@ Targets from [docs/08-performance-budgets.md](docs/08-performance-budgets.md):
 | Post hook shell code | ≤ 0.30 ms |
 | Fork + exec `ghostline log` | ~0.8–1.5 ms |
 | Prompt render delta | ≤ 2 ms total, p99 < 5 ms |
-| Search, 20 results, 500k rows | ≤ 50 ms (FTS target) |
+| Search, 20 results, 500k rows | ≤ 50 ms for FTS rare/miss terms; ranked common tokens may exceed |
 | Daemon batch, 500 rows | ≤ 100 ms background, 0 ms foreground |
 
 `bench --gate` defaults enforced in `src/cmd_bench.rs`, all overridable:
@@ -171,7 +174,7 @@ Search uses trigram FTS for three-character-and-longer queries and a `LIKE` fall
 - Local-first: no sockets, telemetry, accounts, auto-update, or network calls in the default path.
 - The database defaults to `$XDG_DATA_HOME/ghostline/history.db` or `~/.local/share/ghostline/history.db`; the database and its WAL/SHM sidecars are chmod `0600`, and the data directory is chmod `0700`. The queue file defaults to `$XDG_CACHE_HOME/ghostline/queue/history.jsonl` or `~/.cache/ghostline/queue/history.jsonl`.
 - Redaction runs before persistence for `log` and `import`. Rules cover common token formats (OpenAI, Anthropic, GitHub, AWS, Google, Slack, Stripe), JWTs, PEM private keys, database URLs with passwords, `curl -u`, and password/token/key/value patterns. Matches are replaced and the row is marked `sensitive=1`.
-- `GHOSTLINE_IGNORE` excludes matching commands from `log`; `GHOSTLINE_DISABLED` pauses logging and ghost painting. Suggestions never execute; `fix` only prints candidates.
+- `GHOSTLINE_IGNORE` excludes matching commands from `log`; `GHOSTLINE_DISABLED` pauses logging and ghost painting. Suggestions never execute; `fix` only prints candidates. `ghostline forget` deletes rows and their FTS entries; `--vacuum` reclaims free pages.
 - Redaction is best-effort, not a guarantee. Sensitive rows are excluded from suggestions; the database and its WAL/SHM sidecars are chmodded `0600`, and the data directory is chmodded `0700`.
 
 ## Configuration
@@ -228,7 +231,7 @@ Known rough edges in the current source:
 
 - The bash logger polls `history 1`, so very rapid prompts can miss or merge entries; zsh and fish use native pre/post-exec hooks.
 - `duration_ns` is stored as `0`, and the tty/SSH/tmux/container/git context columns are not populated by the shipped hooks.
-- `search` prints stored command text verbatim, including any control bytes logged before redaction.
+- Search ranking is exact/prefix/recency based; bm25 is not used because it added significant latency on very common tokens at 500k rows.
 - The `gl` alias mentioned in older design notes is not installed.
 
 The roadmap tracks deferred work: [docs/09-roadmap.md](docs/09-roadmap.md).

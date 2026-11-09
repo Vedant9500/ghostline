@@ -37,16 +37,20 @@ pub fn run(args: &[String]) -> Result<(), String> {
         i += 1;
     }
     let path = db_path.map(std::path::PathBuf::from).unwrap_or_else(db::default_db_path);
-    let conn = db::open(&path).map_err(|e| format!("open db: {e}"))?;
+    let conn = db::open_read(&path).map_err(|e| format!("open db: {e}"))?;
 
     // Resolve target command: explicit args, or most recent non-zero-exit row.
     let (cmd, cwd, _exit) = if last {
-        let mut stmt = conn
-            .prepare("SELECT cmd, cwd, exit_code FROM history WHERE exit_code != 0 ORDER BY started_at DESC LIMIT 1")
-            .map_err(|e| format!("query last failure: {e}"))?;
-        let row: Option<(String, String, i64)> = stmt
-            .query_row([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-            .ok();
+        let row: Option<(String, String, i64)> = match &conn {
+            Some(conn) => {
+                let mut stmt = conn
+                    .prepare("SELECT cmd, cwd, exit_code FROM history WHERE exit_code != 0 ORDER BY started_at DESC LIMIT 1")
+                    .map_err(|e| format!("query last failure: {e}"))?;
+                stmt.query_row([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                    .ok()
+            }
+            None => None,
+        };
         match row {
             Some(r) => r,
             None => {
@@ -69,13 +73,16 @@ pub fn run(args: &[String]) -> Result<(), String> {
 
     // History context for verb/flag learning: recent commands sharing the first token.
     let first = cmd.split_whitespace().next().unwrap_or("").to_string();
-    let history: Vec<String> = conn
-        .prepare("SELECT cmd FROM history WHERE cmd LIKE ?1 || '%' ORDER BY started_at DESC LIMIT 200")
-        .map_err(|e| format!("history: {e}"))?
-        .query_map([first], |r| r.get(0))
-        .map_err(|e| format!("history: {e}"))?
-        .collect::<Result<_, _>>()
-        .map_err(|e| format!("history: {e}"))?;
+    let history: Vec<String> = match &conn {
+        Some(conn) => conn
+            .prepare("SELECT cmd FROM history WHERE cmd LIKE ?1 || '%' ORDER BY started_at DESC LIMIT 200")
+            .map_err(|e| format!("history: {e}"))?
+            .query_map([first], |r| r.get(0))
+            .map_err(|e| format!("history: {e}"))?
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("history: {e}"))?,
+        None => Vec::new(),
+    };
 
     let cands = fix::suggest(&cmd, &cwd, &history);
     if cands.is_empty() {

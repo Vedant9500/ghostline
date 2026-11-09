@@ -27,6 +27,7 @@ pub fn drain_once(
                 session_id: q.session_id,
                 shell: q.shell,
                 sensitive: q.sensitive,
+                import_key: None,
             })
             .collect();
         // Chunk so one giant queue file can't blow memory or hold the write lock forever.

@@ -3,7 +3,7 @@
 ## Privacy model: local-first
 
 - Default: logging local-only, DB and its WAL/SHM sidecars `chmod 600` (`~/.local/share/ghostline/history.db`), data dir `0700`, cache `~/.cache/ghostline/`, no sockets in default path, no telemetry, no auto-update phone-home.
-- Opt-in only: NL cache, cloud fallback, multi-machine sync (E2EE when built). Everything clearable: `ghostline forget <pattern>`, `--last-n`, `--forget` (NL cache).
+- Opt-in only: NL cache, cloud fallback, multi-machine sync (E2EE when built). Everything clearable: `ghostline forget <pattern>`, `--last-n`, `--older-than`, `--max-rows`, `--all`, and `--forget` (NL cache). `--dry-run` previews matches; `--vacuum` reclaims pages after deletion.
 - Never store wholesale `env`, raw IPs, or full `/proc`. Allowlist (`SHELL,TERM,HOSTNAME,USER,TZ,LANG`) + hashed projections. `ssh_ctx` = hash, not IP.
 - CLI args also leak via `ps`/`/proc`/auditd/scrollback — history redaction covers disk only. Document defense-in-depth: prefer env-var / secret-manager / interactive `-p` over CLI args.
 

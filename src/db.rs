@@ -22,19 +22,28 @@ pub fn default_db_path() -> PathBuf {
 }
 
 /// Per-connection settings. Safe to re-apply on every open.
+///
+/// `auto_vacuum` must be set before the first page is written; putting it
+/// first lets a brand-new database opt into incremental vacuum. Existing
+/// databases keep their mode until a full `VACUUM`.
 const PRAGMAS: &str = "
+PRAGMA auto_vacuum=INCREMENTAL;
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
 PRAGMA busy_timeout=5000;
 PRAGMA foreign_keys=ON;
 ";
 
+/// Read-path timeout: a keystroke must never wait five seconds behind a
+/// checkpoint. Writers keep the long timeout from `PRAGMAS`.
+const READ_BUSY_TIMEOUT_MS: u64 = 100;
+
 /// Current schema version stored in `PRAGMA user_version`.
 ///
 /// Bump this whenever the schema changes and add the matching step to
 /// `migrate()`. The cumulative baseline below is also kept current so fresh
 /// databases and tests get the latest shape in one batch.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Cumulative baseline DDL (version 0 -> latest). Idempotent, so re-baselining
 /// an existing pre-migration database is safe.
@@ -57,7 +66,8 @@ CREATE TABLE IF NOT EXISTS history(
   sudo_user TEXT,
   git_repo TEXT,
   git_branch TEXT,
-  sensitive INTEGER NOT NULL DEFAULT 0
+  sensitive INTEGER NOT NULL DEFAULT 0,
+  import_key TEXT             -- stable key for idempotent HISTFILE imports
 ) STRICT;
 CREATE INDEX IF NOT EXISTS idx_time ON history(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_cwd ON history(cwd, started_at DESC);
@@ -66,6 +76,10 @@ CREATE INDEX IF NOT EXISTS idx_session ON history(session_id, started_at);
 -- successful, non-sensitive rows only; cmd/cwd/started_at read from the index.
 CREATE INDEX IF NOT EXISTS idx_cmd ON history(cmd COLLATE NOCASE, cwd, started_at DESC)
   WHERE exit_code = 0 AND sensitive = 0;
+-- Imported rows carry a deterministic key so re-importing the same HISTFILE
+-- skips rows already present instead of duplicating the whole file.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_import_key ON history(import_key)
+  WHERE import_key IS NOT NULL;
 CREATE VIRTUAL TABLE IF NOT EXISTS history_fts USING fts5(cmd, cwd, tokenize='trigram');
 CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
   INSERT INTO history_fts(rowid, cmd, cwd) VALUES (new.rowid, new.cmd, new.cwd);
@@ -94,6 +108,25 @@ CREATE TRIGGER IF NOT EXISTS history_au AFTER UPDATE ON history BEGIN
 END;
 ";
 
+/// Version 2 -> 3: add the import dedupe key. The column and partial unique
+/// index make re-imports idempotent without affecting logged rows (NULL keys
+/// are ignored by the index). `ALTER TABLE` is guarded by a column check so
+/// the step is also safe on a database that already has the column.
+fn migration_3(conn: &Connection) -> rusqlite::Result<()> {
+    let has_column: i64 = conn.query_row(
+        "SELECT count(*) FROM pragma_table_info('history') WHERE name = 'import_key'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_column == 0 {
+        conn.execute_batch("ALTER TABLE history ADD COLUMN import_key TEXT;")?;
+    }
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_import_key ON history(import_key)
+           WHERE import_key IS NOT NULL;",
+    )
+}
+
 /// Create missing parent directories (0700 when we own the leaf) and open the
 /// database. The main file and its WAL/SHM sidecars are private (0600) because
 /// they contain raw command history.
@@ -104,6 +137,64 @@ pub fn open(path: &std::path::Path) -> rusqlite::Result<Connection> {
     migrate(&conn)?;
     secure_db_files(path);
     Ok(conn)
+}
+
+/// Open an existing database for the read-only hot path (`search`, `suggest`,
+/// `fix`). Returns `None` when the file does not exist so a read never creates
+/// an empty database. Current schemas skip DDL entirely, use a read-only
+/// connection, and get a short busy timeout; an older schema falls back to the
+/// writable `open` path so it can still be migrated.
+pub fn open_read(path: &std::path::Path) -> rusqlite::Result<Option<Connection>> {
+    use rusqlite::OpenFlags;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    conn.busy_timeout(std::time::Duration::from_millis(READ_BUSY_TIMEOUT_MS))?;
+    conn.execute_batch("PRAGMA query_only=ON;")?;
+    let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    if version == SCHEMA_VERSION {
+        return Ok(Some(conn));
+    }
+    drop(conn);
+    open(path).map(Some)
+}
+
+/// A write transaction that takes SQLite's RESERVED lock at `BEGIN IMMEDIATE`.
+/// Deferred transactions can both read and then fight over the lock upgrade;
+/// immediate batches queue from the start and respect `busy_timeout` once.
+pub(crate) struct WriteTxn<'a> {
+    conn: &'a Connection,
+    active: bool,
+}
+
+impl std::ops::Deref for WriteTxn<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        self.conn
+    }
+}
+
+impl WriteTxn<'_> {
+    pub(crate) fn commit(mut self) -> rusqlite::Result<()> {
+        self.conn.execute_batch("COMMIT")?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for WriteTxn<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            self.conn.execute_batch("ROLLBACK").ok();
+        }
+    }
+}
+
+/// Start an immediate write transaction. Used by batch inserts and `forget`.
+pub(crate) fn begin_write(conn: &Connection) -> rusqlite::Result<WriteTxn<'_>> {
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    Ok(WriteTxn { conn, active: true })
 }
 
 fn ensure_parent(path: &std::path::Path) {
@@ -178,6 +269,13 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         tx.commit()?;
         version = 2;
     }
+    if version < 3 {
+        let tx = conn.unchecked_transaction()?;
+        migration_3(&tx)?;
+        tx.pragma_update(None, "user_version", 3)?;
+        tx.commit()?;
+        version = 3;
+    }
     debug_assert_eq!(version, SCHEMA_VERSION, "missing migration step");
     Ok(())
 }
@@ -194,6 +292,8 @@ pub struct Entry {
     pub session_id: String,
     pub shell: String,
     pub sensitive: bool,
+    /// Stable key for idempotent imports; `None` for commands logged normally.
+    pub import_key: Option<String>,
 }
 
 pub fn insert(conn: &Connection, e: &Entry) -> rusqlite::Result<()> {
@@ -206,14 +306,22 @@ pub fn insert_batch(conn: &Connection, entries: &[Entry]) -> rusqlite::Result<us
     if entries.is_empty() {
         return Ok(0);
     }
-    let tx = conn.unchecked_transaction()?;
+    // Imported entries carry import_key; a re-import must skip conflicts
+    // rather than abort the batch. Normal log/daemon batches stay strict.
+    let dedupe = entries.iter().any(|e| e.import_key.is_some());
+    let sql = if dedupe {
+        "INSERT INTO history(id,cmd,cwd,exit_code,duration_ns,started_at,ended_at,hostname,session_id,shell,sensitive,import_key)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING"
+    } else {
+        "INSERT INTO history(id,cmd,cwd,exit_code,duration_ns,started_at,ended_at,hostname,session_id,shell,sensitive,import_key)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?)"
+    };
+    let tx = begin_write(conn)?;
+    let mut inserted = 0usize;
     {
-        let mut stmt = tx.prepare_cached(
-            "INSERT INTO history(id,cmd,cwd,exit_code,duration_ns,started_at,ended_at,hostname,session_id,shell,sensitive)
-             VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-        )?;
+        let mut stmt = tx.prepare_cached(sql)?;
         for e in entries {
-            stmt.execute(params![
+            inserted += stmt.execute(params![
                 uuid::Uuid::now_v7().to_string(),
                 e.cmd,
                 e.cwd,
@@ -225,6 +333,7 @@ pub fn insert_batch(conn: &Connection, entries: &[Entry]) -> rusqlite::Result<us
                 e.session_id,
                 e.shell,
                 if e.sensitive { 1 } else { 0 },
+                e.import_key,
             ])?;
         }
     }
@@ -233,7 +342,7 @@ pub fn insert_batch(conn: &Connection, entries: &[Entry]) -> rusqlite::Result<us
     if let Some(path) = conn.path().filter(|p| !p.is_empty()) {
         secure_db_files(std::path::Path::new(path));
     }
-    Ok(entries.len())
+    Ok(inserted)
 }
 
 /// Trigram FTS5 needs at least one three-character run; shorter queries use LIKE.
@@ -264,7 +373,7 @@ fn fts_phrase(query: &str) -> String {
 }
 
 /// Escape LIKE wildcards so a typed `%`/`_`/`\` stays literal under ESCAPE '\'.
-fn escape_like(s: &str) -> String {
+pub(crate) fn escape_like(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         if matches!(c, '\\' | '%' | '_') {
@@ -348,7 +457,7 @@ pub fn search_sql(
         sql.push_str("AND ?1 IS NULL ");
     }
     if dir.is_some() {
-        sql.push_str("AND (h.cwd = ?2 OR (h.cwd >= ?7 AND h.cwd < ?8)) ");
+        sql.push_str("AND (h.cwd = ?2 OR (h.cwd >= ?9 AND h.cwd < ?10)) ");
     } else {
         sql.push_str("AND ?2 IS NULL ");
     }
@@ -371,7 +480,21 @@ pub fn search_sql(
     } else {
         sql.push_str(" AND ?5 IS NULL");
     }
-    sql.push_str(" ORDER BY h.started_at DESC, h.id DESC LIMIT ?6");
+    // Rank exact matches first, then prefixes, then exact-cwd affinity, and
+    // finally recency. bm25 is deliberately omitted: on a 500k-row database it
+    // added ~40ms to a common-token search, while this ordering keeps the
+    // result useful and the cost bounded. `?7` is the raw query for equality;
+    // `?8` is wildcard-escaped for the prefix LIKE so `%`/`_` stay literal.
+    sql.push_str(
+        " ORDER BY CASE WHEN ?7 = '' THEN 2 \
+                         WHEN h.cmd = ?7 THEN 0 \
+                         WHEN h.cmd LIKE ?8 || '%' ESCAPE '\\' THEN 1 \
+                         ELSE 2 END, ",
+    );
+    sql.push_str(
+        "CASE WHEN ?2 IS NOT NULL AND h.cwd = ?2 THEN 0 ELSE 1 END, \
+         h.started_at DESC, h.id DESC LIMIT ?6",
+    );
     sql
 }
 
@@ -396,8 +519,19 @@ pub fn search(
         Some(escape_like(query))
     };
     let bounds = dir.map(dir_bounds);
+    let raw_query = query.to_string();
+    let prefix_query = escape_like(query);
     let mut stmt = conn.prepare(&sql)?;
-    let mut binds: Vec<&dyn rusqlite::ToSql> = vec![&bind_q, &dir, &session, &host, &since, &limit];
+    let mut binds: Vec<&dyn rusqlite::ToSql> = vec![
+        &bind_q,
+        &dir,
+        &session,
+        &host,
+        &since,
+        &limit,
+        &raw_query,
+        &prefix_query,
+    ];
     if let Some((ref lower, ref upper)) = bounds {
         binds.push(lower);
         binds.push(upper);
@@ -416,17 +550,36 @@ pub fn search_plan(conn: &Connection) -> rusqlite::Result<Vec<String>> {
     let mut stmt = conn.prepare(&full)?;
     let bind_q = fts_phrase("bench");
     let none: Option<&str> = None;
+    let raw_query = "bench";
+    let prefix_query = escape_like(raw_query);
     let rows = stmt.query_map(
-        params![Some(bind_q.as_str()), none, none, none, None::<i64>, 20i64],
+        params![
+            Some(bind_q.as_str()),
+            none,
+            none,
+            none,
+            None::<i64>,
+            20i64,
+            raw_query,
+            prefix_query
+        ],
         |r| r.get::<_, String>(3),
     )?;
     rows.collect()
 }
 
+/// Frecency weight by age: a run in the last four days counts as a full use;
+/// older runs decay (4d/14d/90d buckets), so 100 runs from last year no longer
+/// drown out 10 runs from this week.
 pub const SUGGEST_SQL: &str = "SELECT cmd,
-           (100 * MAX(CASE WHEN cwd = ?2 THEN 1 ELSE 0 END))
-           + 10 * SUM(CASE WHEN cwd = ?2 THEN 1 ELSE 0 END)
-           + 5 * COUNT(*)
+           (100.0 * MAX(CASE WHEN cwd = ?2 THEN 1 ELSE 0 END))
+           + (10.0 * SUM(CASE WHEN cwd = ?2 THEN 1 ELSE 0 END))
+           + SUM(CASE
+               WHEN ?5 - started_at <= 345600000000000 THEN 4.0
+               WHEN ?5 - started_at <= 1209600000000000 THEN 2.0
+               WHEN ?5 - started_at <= 7776000000000000 THEN 1.0
+               ELSE 0.25
+             END)
            AS w,
            max(started_at) AS last_seen
          FROM history h
@@ -436,8 +589,16 @@ pub const SUGGEST_SQL: &str = "SELECT cmd,
          ORDER BY w DESC, last_seen DESC, cmd COLLATE NOCASE
          LIMIT ?3";
 
-/// Ghost suggestion: prefix candidates ranked by dir-affinity + frequency + recency.
-/// Returns full commands (not suffixes); caller strips the typed prefix for ghost rendering.
+fn now_ns() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
+}
+
+/// Ghost suggestion: prefix candidates ranked by dir-affinity + decayed
+/// frecency. Returns full commands (not suffixes); caller strips the typed
+/// prefix for ghost rendering.
 ///
 /// Weight is computed in a single GROUP BY pass (no correlated subqueries:
 /// those made each keystroke O(groups × rows)). Only exit-0 runs count
@@ -453,7 +614,19 @@ pub fn suggest(
     cwd: &str,
     limit: i64,
 ) -> rusqlite::Result<Vec<String>> {
-    // Weight: same-dir hits dominate, frequency follows, recency breaks ties.
+    suggest_at(conn, buffer, cwd, limit, now_ns())
+}
+
+/// `suggest` with an explicit clock for deterministic frecency tests.
+pub fn suggest_at(
+    conn: &Connection,
+    buffer: &str,
+    cwd: &str,
+    limit: i64,
+    now: i64,
+) -> rusqlite::Result<Vec<String>> {
+    // Weight: same-dir hits dominate; frequency is age-decayed (recent runs
+    // count more), and last_seen breaks remaining ties.
     // Control-tainted rows are filtered in Rust; if they crowd out clean
     // candidates, widen the over-fetch until enough clean rows are seen or the
     // prefix is exhausted. Write-time sanitization keeps new rows clean, so the
@@ -467,7 +640,7 @@ pub fn suggest(
     let mut fetch = limit.saturating_add(16);
     loop {
         let raw: Vec<String> = stmt
-            .query_map(params![pattern, cwd, fetch, buffer], |r| {
+            .query_map(params![pattern, cwd, fetch, buffer, now], |r| {
                 r.get::<_, String>(0)
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -489,7 +662,7 @@ pub fn suggest_plan(conn: &Connection) -> rusqlite::Result<Vec<String>> {
     let full = format!("EXPLAIN QUERY PLAN {SUGGEST_SQL}");
     let mut stmt = conn.prepare(&full)?;
     let pattern = format!("{}%", escape_like("bench"));
-    let rows = stmt.query_map(params![pattern, "/bench", 21i64, "bench"], |r| {
+    let rows = stmt.query_map(params![pattern, "/bench", 21i64, "bench", 0i64], |r| {
         r.get::<_, String>(3)
     })?;
     rows.collect()
@@ -515,4 +688,116 @@ pub fn analyze(conn: &Connection) -> rusqlite::Result<()> {
 /// any table needs `ANALYZE`; safe to call after a daemon batch.
 pub fn optimize(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch("PRAGMA optimize;")
+}
+
+/// What `forget` should remove. Selectors are intentionally explicit: a
+/// bare pattern, a time cutoff, the newest N rows, or everything.
+pub enum ForgetMode<'a> {
+    Patterns(&'a [String]),
+    LastN(i64),
+    OlderThanDays(i64),
+    MaxRows(i64),
+    All,
+}
+
+pub struct ForgetReport {
+    pub matched: i64,
+    pub deleted: i64,
+    /// Newest matches, for `--dry-run` previews.
+    pub rows: Vec<(i64, i64, String, String)>,
+}
+
+/// Delete history rows selected by `mode`. `dry_run` reports what would be
+/// removed without deleting. FTS delete triggers keep the search index in sync.
+pub fn forget(
+    conn: &Connection,
+    mode: &ForgetMode<'_>,
+    dry_run: bool,
+) -> rusqlite::Result<ForgetReport> {
+    use rusqlite::types::Value;
+
+    let mut params: Vec<Value> = Vec::new();
+    let where_sql = match mode {
+        ForgetMode::Patterns(patterns) => {
+            if patterns.is_empty() {
+                return Ok(ForgetReport {
+                    matched: 0,
+                    deleted: 0,
+                    rows: Vec::new(),
+                });
+            }
+            let mut clauses = Vec::with_capacity(patterns.len());
+            for (i, pattern) in patterns.iter().enumerate() {
+                params.push(Value::Text(format!("%{}%", escape_like(pattern))));
+                clauses.push(format!("cmd LIKE ?{} ESCAPE '\\'", i + 1));
+            }
+            format!("WHERE ({})", clauses.join(" OR "))
+        }
+        ForgetMode::LastN(n) => {
+            params.push(Value::Integer((*n).max(0)));
+            "WHERE id IN (SELECT id FROM history ORDER BY started_at DESC, id DESC LIMIT ?1)"
+                .to_string()
+        }
+        ForgetMode::OlderThanDays(days) => {
+            let cutoff = now_ns().saturating_sub(
+                (*days).max(0)
+                    .saturating_mul(86_400)
+                    .saturating_mul(1_000_000_000),
+            );
+            params.push(Value::Integer(cutoff));
+            "WHERE started_at < ?1".to_string()
+        }
+        ForgetMode::MaxRows(n) => {
+            params.push(Value::Integer((*n).max(0)));
+            "WHERE id NOT IN (SELECT id FROM history ORDER BY started_at DESC, id DESC LIMIT ?1)"
+                .to_string()
+        }
+        ForgetMode::All => String::new(),
+    };
+
+    let count_sql = format!("SELECT count(*) FROM history {where_sql}");
+    if dry_run {
+        let matched: i64 =
+            conn.query_row(&count_sql, params_from_iter(params.iter()), |r| r.get(0))?;
+        let sql = format!(
+            "SELECT started_at, exit_code, cwd, cmd FROM history {where_sql} \
+             ORDER BY started_at DESC, id DESC LIMIT 20"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params_from_iter(params.iter()), |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        return Ok(ForgetReport {
+            matched,
+            deleted: 0,
+            rows,
+        });
+    }
+    // Count and delete under the same immediate transaction so a concurrent
+    // daemon insert cannot make the report inconsistent.
+    let tx = begin_write(conn)?;
+    let matched: i64 = tx.query_row(&count_sql, params_from_iter(params.iter()), |r| r.get(0))?;
+    let deleted = tx.execute(
+        &format!("DELETE FROM history {where_sql}"),
+        params_from_iter(params),
+    )?;
+    tx.commit()?;
+    Ok(ForgetReport {
+        matched,
+        deleted: deleted as i64,
+        rows: Vec::new(),
+    })
+}
+
+/// Reclaim free pages after a delete. `incremental_vacuum` is a no-op on
+/// databases created before auto-vacuum was enabled; `--vacuum` forces a full
+/// rewrite, which also converts an old database to incremental mode.
+pub fn vacuum(conn: &Connection, full: bool) -> rusqlite::Result<()> {
+    if full {
+        conn.execute_batch("VACUUM;")
+    } else {
+        conn.execute_batch("PRAGMA incremental_vacuum;")
+    }
 }

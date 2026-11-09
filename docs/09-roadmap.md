@@ -8,7 +8,7 @@ No daemon, no sync, no model download. Offline rules + tldr bundle only.
 2. Ghost suggestion: history-prefix + dir-aware frecency rank + tldr-template fallback.
 3. `thefuck`-lite top rules: cd-case, path ≤2, cmd typo, git subcmd, flag typo, sudo-hint, mkdir-p.
 4. `ghostline search` (FTS5 trigram + `--dir/--host/--session/--exit/--since`) + fzf bind (opt-in) + `ghostline import --from histfile`.
-5. `ghostline stats`, `ghostline explain`, `ghostline forget`, `ghostline tldr --update`.
+5. `ghostline stats`, `ghostline explain`, `ghostline tldr --update` (`ghostline forget` and retention shipped).
 6. `ghostline bench` + CI perf gate (`08-performance-budgets.md`).
 7. NL-rules baseline (top-100 intents → tldr slot-fill), no model yet.
 

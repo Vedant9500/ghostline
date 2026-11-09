@@ -78,7 +78,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let path = db_path
         .map(std::path::PathBuf::from)
         .unwrap_or_else(db::default_db_path);
-    let conn = db::open(&path).map_err(|e| format!("open db: {e}"))?;
+    let Some(conn) = db::open_read(&path).map_err(|e| format!("open db: {e}"))? else {
+        return Ok(()); // no history yet: do not create an empty database
+    };
     let rows = db::search(
         &conn,
         &query,

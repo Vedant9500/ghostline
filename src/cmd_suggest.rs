@@ -66,8 +66,12 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let path = db_path
         .map(std::path::PathBuf::from)
         .unwrap_or_else(db::default_db_path);
-    let conn = db::open(&path).map_err(|e| format!("open db: {e}"))?;
-    let mut cands = db::suggest(&conn, &buffer, &cwd, limit).map_err(|e| format!("suggest: {e}"))?;
+    let mut cands = match db::open_read(&path).map_err(|e| format!("open db: {e}"))? {
+        Some(conn) => {
+            db::suggest(&conn, &buffer, &cwd, limit).map_err(|e| format!("suggest: {e}"))?
+        }
+        None => Vec::new(), // no history yet: fall through to PATH completion
+    };
     if cands.is_empty() && !buffer.contains(char::is_whitespace) {
         cands = complete::complete_command(&buffer)
             .into_iter()

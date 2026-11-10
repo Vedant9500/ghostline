@@ -4,7 +4,9 @@
 # release `ghostline bench --gate` against doc budgets. Fails the run on
 # any budget violation. bench.json uploaded for dashboarding.
 #
-# `nightly-matrix`: weekly + manual; bigger seed on ubuntu/macos.
+# `nightly-matrix`: weekly + manual; 50k seed on ubuntu/macos.
+# `bench-500k`: weekly + manual; the review's full 500k-row query gate on
+# ubuntu (rare search, 1-2 char search, suggest, hook, plans).
 # Deferred (not in v1 slice): hyperfine hook-overhead comparison,
 # expect/tmux E2E prompt harness, NFS/container matrix.
 name: perf
@@ -25,12 +27,32 @@ jobs:
       - run: cargo test
       - run: cargo build --release
       - name: bench gate (doc budgets)
-        run: ./target/release/ghostline bench --n 10000 --reps 20 --json --gate | tee bench.json
+        run: |
+          set -o pipefail
+          ./target/release/ghostline bench --n 10000 --reps 20 --json --gate | tee bench.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: bench-ubuntu
           path: bench.json
+
+  bench-500k:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - name: bench gate (500k rows)
+        run: |
+          set -o pipefail
+          ./target/release/ghostline bench --n 500000 --reps 20 --json --gate | tee bench-500k.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-500k
+          path: bench-500k.json
 
   nightly-matrix:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
@@ -43,7 +65,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release
       - name: bench gate (larger seed)
-        run: ./target/release/ghostline bench --n 50000 --reps 20 --json --gate | tee bench-${{ matrix.os }}.json
+        run: |
+          set -o pipefail
+          ./target/release/ghostline bench --n 50000 --reps 20 --json --gate | tee bench-${{ matrix.os }}.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:

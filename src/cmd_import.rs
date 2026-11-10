@@ -2,7 +2,10 @@ use crate::db;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn now_ns() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as i64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
 }
 
 fn hostname() -> String {
@@ -37,9 +40,7 @@ pub fn parse_histfile(text: &str, fallback_ns: i64) -> Vec<(String, i64, usize, 
         }
         const MAX: usize = 8192;
         let mut cmd = cmd;
-        if cmd.len() > MAX {
-            cmd.truncate(MAX);
-        }
+        crate::redact::truncate_utf8(&mut cmd, MAX);
         // Untimestamped lines keep file order instead of all sharing one
         // started_at (which made newest-first ordering arbitrary). The
         // `timed` flag keeps their dedupe key independent of this clock.
@@ -61,13 +62,7 @@ pub fn parse_histfile(text: &str, fallback_ns: i64) -> Vec<(String, i64, usize, 
 /// are not guaranteed). The key covers the source path, line number, timestamp
 /// and stored command, so re-importing the same file is idempotent while a
 /// different file (or an appended line) still imports.
-fn import_key(
-    source: &str,
-    line_no: usize,
-    started_at: i64,
-    cmd: &str,
-    timed: bool,
-) -> String {
+fn import_key(source: &str, line_no: usize, started_at: i64, cmd: &str, timed: bool) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     let mut feed = |bytes: &[u8]| {
         for &b in bytes {
@@ -112,7 +107,11 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 shell = args.get(i).cloned().unwrap_or("bash".into());
             }
             "--no-dedupe" => dedupe = false,
-            s => return Err(format!("unknown flag '{s}' (usage: ghostline import [--from HISTFILE] [--db P] [--no-dedupe])")),
+            s => {
+                return Err(format!(
+                    "unknown flag '{s}' (usage: ghostline import [--from HISTFILE] [--db P] [--no-dedupe])"
+                ));
+            }
         }
         i += 1;
     }
@@ -120,7 +119,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
         let home = db::path_from_env(std::env::var_os("HOME")).unwrap_or_else(|| ".".into());
         home.join(".bash_history")
     });
-    let text = std::fs::read_to_string(&histfile).map_err(|e| format!("read {}: {e}", histfile.display()))?;
+    let text = std::fs::read_to_string(&histfile)
+        .map_err(|e| format!("read {}: {e}", histfile.display()))?;
     let source = std::fs::canonicalize(&histfile)
         .unwrap_or_else(|_| histfile.clone())
         .to_string_lossy()
@@ -134,9 +134,16 @@ pub fn run(args: &[String]) -> Result<(), String> {
             let (cmd, sensitive) = crate::redact::redact(&cmd);
             let key = dedupe.then(|| import_key(&source, line_no, ts, &cmd, timed));
             db::Entry {
-                cmd, cwd: String::new(), exit_code: 0, duration_ns: 0,
-                started_at: ts, ended_at: ts, hostname: hostname(),
-                session_id: "import".into(), shell: shell.clone(), sensitive,
+                cmd,
+                cwd: String::new(),
+                exit_code: 0,
+                duration_ns: 0,
+                started_at: ts,
+                ended_at: ts,
+                hostname: hostname(),
+                session_id: "import".into(),
+                shell: shell.clone(),
+                sensitive,
                 import_key: key,
             }
         })
@@ -145,7 +152,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
         println!("nothing to import from {}", histfile.display());
         return Ok(());
     }
-    let path = db_path.map(std::path::PathBuf::from).unwrap_or_else(db::default_db_path);
+    let path = db_path
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(db::default_db_path);
     let conn = db::open(&path).map_err(|e| format!("open db: {e}"))?;
     let mut n = 0;
     for chunk in entries.chunks(500) {
@@ -154,7 +163,10 @@ pub fn run(args: &[String]) -> Result<(), String> {
     db::analyze(&conn).map_err(|e| format!("analyze: {e}"))?;
     let skipped = total - n;
     if skipped > 0 {
-        println!("imported {n} commands from {} ({skipped} duplicates skipped)", histfile.display());
+        println!(
+            "imported {n} commands from {} ({skipped} duplicates skipped)",
+            histfile.display()
+        );
     } else {
         println!("imported {n} commands from {}", histfile.display());
     }
@@ -222,5 +234,13 @@ mod tests {
         let rows = parse_histfile(&text, 1);
         assert_eq!(rows.len(), 1);
         assert!(rows[0].0.len() <= 8192);
+    }
+
+    #[test]
+    fn truncates_multibyte_lines_at_a_char_boundary() {
+        let text = format!("{}é{}", "a".repeat(8191), "z".repeat(10));
+        let rows = parse_histfile(&text, 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "a".repeat(8191));
     }
 }

@@ -22,15 +22,18 @@ pub fn build_entry(
     session: &str,
     cmd: &str,
 ) -> Option<db::Entry> {
+    // Check ignorespace before cleaning: `clean_command` strips the leading
+    // space, which would otherwise defeat the HISTCONTROL=ignorespace mirror.
+    if cmd.starts_with(' ') {
+        return None;
+    }
     // Control bytes would be replayed as terminal escapes by search/ghost.
     let mut cmd = redact::clean_command(cmd);
     if cmd.is_empty() {
         return None;
     }
     const MAX: usize = 8192;
-    if cmd.len() > MAX {
-        cmd.truncate(MAX);
-    }
+    redact::truncate_utf8(&mut cmd, MAX);
     if cmd.starts_with("ghostline ") || cmd == "ghostline" {
         return None; // never log self
     }
@@ -157,5 +160,17 @@ mod tests {
         let e = build_entry("bash", "/r", 0, "s", "echo \x1b[7mBOLD\x1b[0m").unwrap();
         assert_eq!(e.cmd, "echo [7mBOLD[0m");
         assert!(build_entry("bash", "/r", 0, "s", "\x1b\x07").is_none());
+    }
+
+    #[test]
+    fn ignorespace_prefix_is_not_logged() {
+        assert!(build_entry("bash", "/r", 0, "s", " secret-command").is_none());
+    }
+
+    #[test]
+    fn truncates_multibyte_commands_at_a_char_boundary() {
+        let cmd = format!("{}é{}", "a".repeat(8191), "z".repeat(10));
+        let e = build_entry("bash", "/r", 0, "s", &cmd).unwrap();
+        assert_eq!(e.cmd, "a".repeat(8191));
     }
 }

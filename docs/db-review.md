@@ -365,6 +365,8 @@ Query plans and SQL timings were measured with the `sqlite3` 3.54.1 CLI on a war
 
 ## Resolution log (2026-11-09)
 
+> Historical note: this log records the state on 2026-11-09. The final follow-up at the end supersedes the schema version, FTS content mode, suggest aggregate source, short-query handling, and test-count details below.
+
 | Finding | Status | Change |
 |---|---|---|
 | 1. `--since` units | Fixed | `cmd_search::since_to_ns` converts Unix seconds to nanoseconds (nanosecond inputs pass through); invalid/negative values now error. |
@@ -397,11 +399,11 @@ Measured on the synthetic 500k-row database:
 | `search` no match | 94 ms | 2.4 ms |
 | `search` rare substring | ~17 ms | 6.0 ms |
 | `search` common substring | 0.17 ms (early exit) | ~37 ms (FTS) |
-| `search` short (1–2 char) miss | 94 ms | ~112 ms (LIKE fallback, unchanged) |
+| `search` short (1–2 char) miss | 94 ms | ~112 ms (historical LIKE fallback; replaced in the final follow-up) |
 
-The FTS path trades the old early-exit win on very common substrings for large wins on misses and rare terms; both common and miss cases stay within the 50 ms search budget at 500k rows. Short queries cannot use trigrams and retain the old LIKE cost.
+The FTS path trades the old early-exit win on very common substrings for large wins on misses and rare terms; both common and miss cases stay within the 50 ms search budget at 500k rows. Short queries cannot use trigrams; the original LIKE fallback was replaced by the distinct-index / time-index paths below.
 
-Tests added: `since_to_ns` unit tests, `ghost_suffix` case/boundary tests, sensitive suppression, FTS/LIKE search behavior, wildcard literals, a plan assertion that suggest uses `idx_cmd`, `--dir` subtree/trailing-slash/root behavior, negative limits, suggest starvation, control stripping at log/import/search time, schema migration/version rejection, Unix `0600`/`0700` permissions, arbitrary exit filters, deterministic tie-breaks, FTS update/delete triggers, planner stats, empty-XDG handling, and increasing import timestamps. `cargo test` is green (70 unit + 3 pty).
+Tests added: `since_to_ns` unit tests, `ghost_suffix` case/boundary tests, sensitive suppression, FTS/LIKE search behavior, wildcard literals, a plan assertion that suggest stays off `history`, `--dir` subtree/trailing-slash/root behavior, negative limits, suggest starvation, control stripping at log/import/search time, schema migration/version rejection, Unix `0600`/`0700` permissions, arbitrary exit filters, deterministic tie-breaks, FTS update/delete triggers, planner stats, empty-XDG handling, and increasing import timestamps. `cargo test` is green (97 unit + 3 pty).
 
 The v1→v2 migration test simulates an old database with the broken `'delete'` trigger, then verifies the repaired trigger and the new update trigger both work.
 
@@ -418,4 +420,36 @@ For finding 9, a SQL-level `cmd NOT GLOB '*[control]*'` filter was measured but 
 | 9. Read-only hot path | Implemented | `open_read` uses `SQLITE_OPEN_READ_ONLY`, `query_only`, and a 100 ms busy timeout. Current schemas skip DDL; missing databases return no rows instead of creating a file. `search`, `suggest`, and `fix` use it. |
 | 12. `BEGIN IMMEDIATE` | Implemented | Batch inserts start with `BEGIN IMMEDIATE`, so writers take the RESERVED lock up front instead of racing a deferred lock upgrade. |
 
-Still open from the review's non-numbered list: precomputed suggestion aggregates (#1), UUID BLOB storage (#8), external-content FTS (#11), destructive-command suppression, the 500k-row CI query job, and the short-query LIKE fallback cost.
+## Final follow-up (2026-11-10)
+
+All remaining review items, the partial permission-failure item, and two independently found bugs are now implemented. Schema version is **6**.
+
+| Item | Status | Change |
+|---|---|---|
+| Precomputed suggestion aggregates (#1) | Implemented | `cmd_stats` and `cmd_dir_stats` hold exact successful/non-sensitive counts and `last_seen`, maintained by insert/delete/update triggers. `SUGGEST_SQL` reads only these tables plus `cmd_dir_stats`; it never scans `history`. |
+| UUID BLOB storage (#8) | Implemented | `history.id` is a 16-byte BLOB UUIDv7. Migration v3→v4 rebuilds the table and all 19 columns, parses valid TEXT UUIDs, regenerates malformed ones, and rebuilds FTS. |
+| External-content FTS (#11) | Implemented | `history_fts` is `content='history'`, `content_rowid='rowid'`; insert/delete/update triggers use the FTS `'delete'` command. Migration v4 converts regular FTS tables and rebuilds postings. |
+| Destructive-command suppression | Implemented | `redact::is_destructive` filters force-pushes (`--force*`, `-f`, `+refspec`, `--mirror`, `--delete`), `git reset --hard`, `git clean -f*`, `git branch -D`, `rm -r/-f`, `rmdir`, recursive `chmod 777`, `dd of=`, `mkfs*`, shutdown/reboot, and fork bombs. Rows stay in history/search. |
+| 500k-row CI query job | Implemented | `.github/workflows/perf.yml` has a schedule/dispatch `bench-500k` job running `ghostline bench --n 500000 --reps 20 --json --gate` and uploading the report. PR/nightly jobs remain at 10k/50k. |
+| Short-query LIKE cost | Fixed | Rare/miss 1–2 char queries probe distinct `cmd_index`/`cwd_index` values through `idx_cmd_all`/`idx_cwd`; a zero-match result returns immediately; broad queries walk `idx_time` in recency order and stop at the limit. A capped count decides which path to use. Schema v6 adds `id` to `idx_time` so the broad path needs no temp sort. |
+| Permission failures silently swallowed (partial) | Fixed | Directory creation and chmod failures now print `ghostline: warning: …` to stderr. Missing WAL/SHM sidecars are not treated as failures. |
+| UTF-8 truncation panic | Fixed | `redact::truncate_utf8` backs up to a char boundary before truncating; `log` and `import` both use it. Regression tests cover multibyte commands at the 8 KiB cap. |
+| HISTCONTROL `ignorespace` | Fixed | A command starting with a space is rejected before normalization, so it is not logged. |
+| Short-query common case | Fixed | The first adaptive implementation still materialized every matching rowid (~248 ms for a broad 1-char query at 500k). The row-capped strategy switch and `idx_time` early exit reduce that to 0.54 ms p50 while keeping the miss path at 0.15 ms. |
+
+Tests added or updated: `migration_v3_rebuilds_text_ids_external_fts_and_stats`, `suggestion_aggregates_track_updates_and_deletes`, `suggest_plan_uses_aggregate_table`, `search_short_query_uses_distinct_index`, `search_broad_short_query_walks_time_index`, `suggest_skips_destructive_commands`, `truncate_utf8_never_splits_a_character`, `truncates_multibyte_commands_at_a_char_boundary`, `truncates_multibyte_lines_at_a_char_boundary`, and `ignorespace_prefix_is_not_logged`. `cargo test` is green (97 unit + 3 pty).
+
+Release 500k gate (`--n 500000 --reps 20 --gate`, all PASS):
+
+| Metric | p50 | p99 |
+|---|---:|---:|
+| log | 0.061 ms | 0.198 ms |
+| search, rare | 3.08 ms | 3.48 ms |
+| search, common | 33.0 ms | 34.1 ms |
+| search, short rare (`ra`) | 0.32 ms | 0.46 ms |
+| search, short miss (`zz`) | 0.15 ms | 0.15 ms |
+| search, short broad | 0.54 ms | 0.58 ms |
+| suggest | 0.58 ms | 0.71 ms |
+| hook | 2.25 ms | 2.74 ms |
+
+Throughput was 24,730 inserts/s; all index/plan checks passed (`history_fts` + primary key, `idx_cmd_all` short probe, `idx_time` broad short walk, `cmd_stats` suggest). The 500k corpus has 500k rows, 4,000 distinct commands, 7 common cwds, and one rare marker row so prefix ranking stays bounded; this matches the documented benchmark shape.

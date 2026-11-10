@@ -43,15 +43,15 @@ const READ_BUSY_TIMEOUT_MS: u64 = 100;
 /// Bump this whenever the schema changes and add the matching step to
 /// `migrate()`. The cumulative baseline below is also kept current so fresh
 /// databases and tests get the latest shape in one batch.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 6;
 
-/// Cumulative baseline DDL (version 0 -> latest). Idempotent, so re-baselining
-/// an existing pre-migration database is safe. Indexes that depend on a column
-/// added by a migration (for example `import_key`) live in that migration, not
-/// here, so re-baselining a legacy table without the column cannot fail.
-pub const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS history(
-  id TEXT PRIMARY KEY,
+/// Latest `history` table. `id` is a 16-byte UUIDv7 BLOB: it is internal, so
+/// the compact form saves the 36-byte text index without changing ordering
+/// (UUIDv7 bytes sort chronologically).
+fn history_table_ddl(name: &str) -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS {name}(
+  id BLOB PRIMARY KEY,
   cmd TEXT NOT NULL,
   cwd TEXT NOT NULL,
   exit_code INTEGER NOT NULL,
@@ -70,34 +70,182 @@ CREATE TABLE IF NOT EXISTS history(
   git_branch TEXT,
   sensitive INTEGER NOT NULL DEFAULT 0,
   import_key TEXT             -- stable key for idempotent HISTFILE imports
+) STRICT;"
+    )
+}
+
+/// Cumulative baseline DDL (version 0 -> latest). Idempotent, so re-baselining
+/// an existing pre-migration database is safe. Indexes that depend on a column
+/// added by a migration (for example `import_key`) live in that migration, not
+/// here, so re-baselining a legacy table without the column cannot fail.
+///
+/// Suggestion stats (`cmd_stats`/`cmd_dir_stats`) are maintained by triggers:
+/// they contain only successful, non-sensitive rows, exactly the set suggest
+/// may offer. `cmd_index`/`cwd_index` are distinct-value sets for the 1-2
+/// character search path; stale values are harmless because the final query
+/// still reads `history`.
+pub const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS history(
+  id BLOB PRIMARY KEY,
+  cmd TEXT NOT NULL,
+  cwd TEXT NOT NULL,
+  exit_code INTEGER NOT NULL,
+  duration_ns INTEGER NOT NULL DEFAULT 0,
+  started_at INTEGER NOT NULL,
+  ended_at INTEGER NOT NULL,
+  hostname TEXT NOT NULL DEFAULT '',
+  session_id TEXT NOT NULL DEFAULT '',
+  shell TEXT NOT NULL DEFAULT '',
+  tty TEXT,
+  ssh_ctx TEXT,
+  tmux TEXT,
+  container TEXT,
+  sudo_user TEXT,
+  git_repo TEXT,
+  git_branch TEXT,
+  sensitive INTEGER NOT NULL DEFAULT 0,
+  import_key TEXT
 ) STRICT;
-CREATE INDEX IF NOT EXISTS idx_time ON history(started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_time ON history(started_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_cwd ON history(cwd, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_session ON history(session_id, started_at);
--- Covering partial index for the per-keystroke prefix query in suggest():
--- successful, non-sensitive rows only; cmd/cwd/started_at read from the index.
+-- Covering partial index for legacy/fallback prefix lookups.
 CREATE INDEX IF NOT EXISTS idx_cmd ON history(cmd COLLATE NOCASE, cwd, started_at DESC)
   WHERE exit_code = 0 AND sensitive = 0;
+-- Full command index for the 1-2 character search path (all rows, not partial).
+CREATE INDEX IF NOT EXISTS idx_cmd_all ON history(cmd COLLATE NOCASE, started_at DESC);
 -- idx_import_key is created by migration_3, after the column exists. Keeping
 -- it out of the baseline lets a pre-versioning database (user_version=0) whose
 -- table predates import_key still re-baseline without error.
-CREATE VIRTUAL TABLE IF NOT EXISTS history_fts USING fts5(cmd, cwd, tokenize='trigram');
+
+-- External-content FTS: the trigram index stores postings only, not a second
+-- copy of every command. Triggers must use the special 'delete' command for
+-- external content, hence the old plain DELETE is only used by migration 2.
+CREATE VIRTUAL TABLE IF NOT EXISTS history_fts USING fts5(
+  cmd, cwd, content='history', content_rowid='rowid', tokenize='trigram'
+);
 CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
   INSERT INTO history_fts(rowid, cmd, cwd) VALUES (new.rowid, new.cmd, new.cwd);
 END;
 CREATE TRIGGER IF NOT EXISTS history_ad AFTER DELETE ON history BEGIN
-  DELETE FROM history_fts WHERE rowid = old.rowid;
+  INSERT INTO history_fts(history_fts, rowid, cmd, cwd)
+    VALUES ('delete', old.rowid, old.cmd, old.cwd);
 END;
 CREATE TRIGGER IF NOT EXISTS history_au AFTER UPDATE ON history BEGIN
-  DELETE FROM history_fts WHERE rowid = old.rowid;
+  INSERT INTO history_fts(history_fts, rowid, cmd, cwd)
+    VALUES ('delete', old.rowid, old.cmd, old.cwd);
   INSERT INTO history_fts(rowid, cmd, cwd) VALUES (new.rowid, new.cmd, new.cwd);
+END;
+
+-- Precomputed suggestion aggregates (no scan over history on a keystroke).
+CREATE TABLE IF NOT EXISTS cmd_stats(
+  cmd TEXT PRIMARY KEY COLLATE NOCASE,
+  n INTEGER NOT NULL,
+  last_seen INTEGER NOT NULL
+) STRICT, WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS cmd_dir_stats(
+  cmd TEXT NOT NULL COLLATE NOCASE,
+  cwd TEXT NOT NULL,
+  n INTEGER NOT NULL,
+  last_seen INTEGER NOT NULL,
+  PRIMARY KEY (cmd, cwd)
+) STRICT, WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS cmd_index(
+  cmd TEXT PRIMARY KEY COLLATE NOCASE
+) STRICT, WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS cwd_index(
+  cwd TEXT PRIMARY KEY
+) STRICT, WITHOUT ROWID;
+
+CREATE TRIGGER IF NOT EXISTS history_stats_ai AFTER INSERT ON history
+WHEN new.exit_code = 0 AND new.sensitive = 0
+BEGIN
+  INSERT INTO cmd_stats(cmd, n, last_seen) VALUES(new.cmd, 1, new.started_at)
+    ON CONFLICT(cmd) DO UPDATE SET
+      n = n + 1, last_seen = max(last_seen, excluded.last_seen);
+  INSERT INTO cmd_dir_stats(cmd, cwd, n, last_seen)
+    VALUES(new.cmd, new.cwd, 1, new.started_at)
+    ON CONFLICT(cmd, cwd) DO UPDATE SET
+      n = n + 1, last_seen = max(last_seen, excluded.last_seen);
+END;
+CREATE TRIGGER IF NOT EXISTS history_stats_ad AFTER DELETE ON history
+WHEN old.exit_code = 0 AND old.sensitive = 0
+BEGIN
+  UPDATE cmd_stats SET
+    n = n - 1,
+    last_seen = CASE WHEN old.started_at >= last_seen
+      THEN COALESCE((SELECT max(started_at) FROM history
+                     WHERE cmd = old.cmd COLLATE NOCASE
+                       AND exit_code = 0 AND sensitive = 0), last_seen)
+      ELSE last_seen END
+  WHERE cmd = old.cmd COLLATE NOCASE;
+  DELETE FROM cmd_stats WHERE cmd = old.cmd COLLATE NOCASE AND n <= 0;
+  UPDATE cmd_dir_stats SET
+    n = n - 1,
+    last_seen = CASE WHEN old.started_at >= last_seen
+      THEN COALESCE((SELECT max(started_at) FROM history
+                     WHERE cmd = old.cmd COLLATE NOCASE AND cwd = old.cwd
+                       AND exit_code = 0 AND sensitive = 0), last_seen)
+      ELSE last_seen END
+  WHERE cmd = old.cmd COLLATE NOCASE AND cwd = old.cwd;
+  DELETE FROM cmd_dir_stats
+    WHERE cmd = old.cmd COLLATE NOCASE AND cwd = old.cwd AND n <= 0;
+END;
+-- UPDATE needs separate remove/add triggers so the aggregate stays exact when
+-- a redaction or future edit changes cmd/cwd/exit/sensitive/started_at.
+CREATE TRIGGER IF NOT EXISTS history_stats_au_remove AFTER UPDATE ON history
+WHEN old.exit_code = 0 AND old.sensitive = 0
+BEGIN
+  UPDATE cmd_stats SET
+    n = n - 1,
+    last_seen = CASE WHEN old.started_at >= last_seen
+      THEN COALESCE((SELECT max(started_at) FROM history
+                     WHERE cmd = old.cmd COLLATE NOCASE
+                       AND exit_code = 0 AND sensitive = 0), last_seen)
+      ELSE last_seen END
+  WHERE cmd = old.cmd COLLATE NOCASE;
+  DELETE FROM cmd_stats WHERE cmd = old.cmd COLLATE NOCASE AND n <= 0;
+  UPDATE cmd_dir_stats SET
+    n = n - 1,
+    last_seen = CASE WHEN old.started_at >= last_seen
+      THEN COALESCE((SELECT max(started_at) FROM history
+                     WHERE cmd = old.cmd COLLATE NOCASE AND cwd = old.cwd
+                       AND exit_code = 0 AND sensitive = 0), last_seen)
+      ELSE last_seen END
+  WHERE cmd = old.cmd COLLATE NOCASE AND cwd = old.cwd;
+  DELETE FROM cmd_dir_stats
+    WHERE cmd = old.cmd COLLATE NOCASE AND cwd = old.cwd AND n <= 0;
+END;
+CREATE TRIGGER IF NOT EXISTS history_stats_au_add AFTER UPDATE ON history
+WHEN new.exit_code = 0 AND new.sensitive = 0
+BEGIN
+  INSERT INTO cmd_stats(cmd, n, last_seen) VALUES(new.cmd, 1, new.started_at)
+    ON CONFLICT(cmd) DO UPDATE SET
+      n = n + 1, last_seen = max(last_seen, excluded.last_seen);
+  INSERT INTO cmd_dir_stats(cmd, cwd, n, last_seen)
+    VALUES(new.cmd, new.cwd, 1, new.started_at)
+    ON CONFLICT(cmd, cwd) DO UPDATE SET
+      n = n + 1, last_seen = max(last_seen, excluded.last_seen);
+END;
+
+-- Distinct-value sets for short search. Stale entries only cause harmless
+-- index probes; the query still selects from history.
+CREATE TRIGGER IF NOT EXISTS history_index_ai AFTER INSERT ON history BEGIN
+  INSERT OR IGNORE INTO cmd_index(cmd) VALUES(new.cmd);
+  INSERT OR IGNORE INTO cwd_index(cwd) VALUES(new.cwd);
+END;
+CREATE TRIGGER IF NOT EXISTS history_index_au AFTER UPDATE ON history BEGIN
+  INSERT OR IGNORE INTO cmd_index(cmd) VALUES(new.cmd);
+  INSERT OR IGNORE INTO cwd_index(cwd) VALUES(new.cwd);
 END;
 ";
 
 /// Version 1 -> 2: keep the FTS index in sync on updates, and repair the
 /// delete trigger. `history_fts` is a regular FTS5 table, so the special
 /// `'delete'` insert used by older databases raises "SQL logic error"; a
-/// plain `DELETE ... WHERE rowid` is the correct operation.
+/// plain `DELETE ... WHERE rowid` is the correct operation. This step is
+/// skipped when the table is already external-content (the v4 conversion
+/// installs the special-command triggers itself).
 const MIGRATION_2: &str = "
 DROP TRIGGER IF EXISTS history_ad;
 CREATE TRIGGER history_ad AFTER DELETE ON history BEGIN
@@ -125,6 +273,139 @@ fn migration_3(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_import_key ON history(import_key)
            WHERE import_key IS NOT NULL;",
+    )
+}
+
+/// Turn a stored UUID into the 16-byte BLOB form. Malformed legacy ids are
+/// regenerated: the id is internal, never displayed, and only needs to be
+/// unique and roughly time-ordered.
+fn uuid_blob(value: rusqlite::types::Value) -> Vec<u8> {
+    use rusqlite::types::Value;
+    match value {
+        Value::Blob(b) if b.len() == 16 => b,
+        Value::Text(s) => uuid::Uuid::parse_str(&s)
+            .map(|u| u.as_bytes().to_vec())
+            .unwrap_or_else(|_| uuid::Uuid::now_v7().as_bytes().to_vec()),
+        _ => uuid::Uuid::now_v7().as_bytes().to_vec(),
+    }
+}
+
+/// Rebuild `history` with a BLOB primary key. SQLite cannot change a column
+/// type in place, and the table rebuild is also the cleanest way to drop the
+/// old UUID-text index. All columns are copied; FTS/indexes/triggers are
+/// recreated by `SCHEMA` afterwards.
+fn rebuild_history_blob_ids(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS history_ai;
+         DROP TRIGGER IF EXISTS history_ad;
+         DROP TRIGGER IF EXISTS history_au;
+         DROP TABLE IF EXISTS history_fts;
+         DROP TABLE IF EXISTS history_new;",
+    )?;
+    conn.execute_batch(&history_table_ddl("history_new"))?;
+    {
+        let mut select = conn.prepare(
+            "SELECT id, cmd, cwd, exit_code, duration_ns, started_at, ended_at,
+                    hostname, session_id, shell, tty, ssh_ctx, tmux, container,
+                    sudo_user, git_repo, git_branch, sensitive, import_key
+               FROM history",
+        )?;
+        let mut rows = select.query([])?;
+        let mut insert = conn.prepare(
+            "INSERT INTO history_new(
+                id, cmd, cwd, exit_code, duration_ns, started_at, ended_at,
+                hostname, session_id, shell, tty, ssh_ctx, tmux, container,
+                sudo_user, git_repo, git_branch, sensitive, import_key
+             ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        )?;
+        while let Some(row) = rows.next()? {
+            let id = uuid_blob(row.get(0)?);
+            insert.execute(params![
+                id,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, Option<String>>(11)?,
+                row.get::<_, Option<String>>(12)?,
+                row.get::<_, Option<String>>(13)?,
+                row.get::<_, Option<String>>(14)?,
+                row.get::<_, Option<String>>(15)?,
+                row.get::<_, Option<String>>(16)?,
+                row.get::<_, i64>(17)?,
+                row.get::<_, Option<String>>(18)?,
+            ])?;
+        }
+    }
+    conn.execute_batch(
+        "DROP TABLE history;
+         ALTER TABLE history_new RENAME TO history;",
+    )
+}
+
+/// Version 3 -> 4: BLOB UUIDs and external-content FTS. The table rebuild and
+/// FTS rebuild are done in one step so a 500k-row database pays the copy cost
+/// once. `SCHEMA` recreates the latest indexes/triggers/stats tables.
+fn migration_4(conn: &Connection) -> rusqlite::Result<()> {
+    let id_type: String = conn.query_row(
+        "SELECT type FROM pragma_table_info('history') WHERE name = 'id'",
+        [],
+        |r| r.get(0),
+    )?;
+    if !id_type.eq_ignore_ascii_case("BLOB") {
+        rebuild_history_blob_ids(conn)?;
+    }
+    // Drop the old regular-content FTS (or a stale external one) and let the
+    // latest baseline recreate external-content FTS + all triggers.
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS history_ai;
+         DROP TRIGGER IF EXISTS history_ad;
+         DROP TRIGGER IF EXISTS history_au;
+         DROP TABLE IF EXISTS history_fts;",
+    )?;
+    conn.execute_batch(SCHEMA)?;
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_import_key ON history(import_key)
+           WHERE import_key IS NOT NULL;
+         INSERT INTO history_fts(history_fts) VALUES('rebuild');",
+    )
+}
+
+/// Version 5 -> 6: make the time index cover `id` as well. Broad 1-2 char
+/// searches then scan this index in recency order and stop at the LIMIT,
+/// without a temp sort over every match.
+fn migration_6(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "DROP INDEX IF EXISTS idx_time;
+         CREATE INDEX idx_time ON history(started_at DESC, id DESC);",
+    )
+}
+
+/// Version 4 -> 5: backfill the suggestion aggregates and short-search
+/// distinct sets. Triggers keep them current for all later inserts/deletes.
+fn migration_5(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(SCHEMA)?;
+    conn.execute_batch(
+        "DELETE FROM cmd_stats;
+         DELETE FROM cmd_dir_stats;
+         DELETE FROM cmd_index;
+         DELETE FROM cwd_index;
+         INSERT INTO cmd_stats(cmd, n, last_seen)
+           SELECT cmd, count(*), max(started_at) FROM history
+            WHERE exit_code = 0 AND sensitive = 0
+            GROUP BY cmd COLLATE NOCASE;
+         INSERT INTO cmd_dir_stats(cmd, cwd, n, last_seen)
+           SELECT cmd, cwd, count(*), max(started_at) FROM history
+            WHERE exit_code = 0 AND sensitive = 0
+            GROUP BY cmd COLLATE NOCASE, cwd;
+         INSERT OR IGNORE INTO cmd_index(cmd) SELECT DISTINCT cmd FROM history;
+         INSERT OR IGNORE INTO cwd_index(cwd) SELECT DISTINCT cwd FROM history;",
     )
 }
 
@@ -198,6 +479,19 @@ pub(crate) fn begin_write(conn: &Connection) -> rusqlite::Result<WriteTxn<'_>> {
     Ok(WriteTxn { conn, active: true })
 }
 
+/// Surface permission failures instead of silently leaving history readable.
+/// A warning is used rather than an error because a successful insert must not
+/// be reported as failed just because a filesystem refuses a chmod.
+#[cfg(unix)]
+fn warn_permission(path: &std::path::Path, result: std::io::Result<()>) {
+    if let Err(e) = result {
+        eprintln!(
+            "ghostline: warning: could not set private permissions on {}: {e}",
+            path.display()
+        );
+    }
+}
+
 fn ensure_parent(path: &std::path::Path) {
     let Some(parent) = path.parent() else {
         return;
@@ -206,7 +500,12 @@ fn ensure_parent(path: &std::path::Path) {
         return;
     }
     let existed = parent.exists();
-    std::fs::create_dir_all(parent).ok();
+    if let Err(e) = std::fs::create_dir_all(parent) {
+        eprintln!(
+            "ghostline: warning: could not create data directory {}: {e}",
+            parent.display()
+        );
+    }
     #[cfg(unix)]
     {
         use std::ffi::OsStr;
@@ -215,7 +514,10 @@ fn ensure_parent(path: &std::path::Path) {
         // the default data dir and should never be group/world readable.
         let is_data_dir = parent.file_name() == Some(OsStr::new("ghostline"));
         if !existed || is_data_dir {
-            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).ok();
+            warn_permission(
+                parent,
+                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)),
+            );
         }
     }
 }
@@ -227,15 +529,20 @@ fn secure_db_files(path: &std::path::Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).ok();
+        warn_permission(
+            path,
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)),
+        );
         for suffix in ["-wal", "-shm"] {
             let mut sidecar = path.as_os_str().to_owned();
             sidecar.push(suffix);
-            std::fs::set_permissions(
-                std::path::PathBuf::from(sidecar),
-                std::fs::Permissions::from_mode(0o600),
-            )
-            .ok();
+            let sidecar = std::path::PathBuf::from(sidecar);
+            if sidecar.exists() {
+                warn_permission(
+                    &sidecar,
+                    std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o600)),
+                );
+            }
         }
     }
     #[cfg(not(unix))]
@@ -256,16 +563,42 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     }
     // One block per version step. Keep each step idempotent: databases created
     // before versioning report 0 even though the baseline objects exist.
-    if version < 1 {
+    if version == 0 {
+        let history_exists: i64 = conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='history'",
+            [],
+            |r| r.get(0),
+        )?;
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(SCHEMA)?;
+        if history_exists == 0 {
+            // Fresh database: the baseline is already the latest shape, so do
+            // not replay the historical steps (and do not pay for a rebuild).
+            // idx_import_key is normally created by migration_3; a fresh DB
+            // skips that step, so create it here.
+            tx.execute_batch(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_import_key ON history(import_key)
+                   WHERE import_key IS NOT NULL;",
+            )?;
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            tx.commit()?;
+            return Ok(());
+        }
         tx.pragma_update(None, "user_version", 1)?;
         tx.commit()?;
         version = 1;
     }
     if version < 2 {
         let tx = conn.unchecked_transaction()?;
-        tx.execute_batch(MIGRATION_2)?;
+        let external: i64 = tx.query_row(
+            "SELECT count(*) FROM sqlite_master
+              WHERE name = 'history_fts' AND sql LIKE '%content=%'",
+            [],
+            |r| r.get(0),
+        )?;
+        if external == 0 {
+            tx.execute_batch(MIGRATION_2)?;
+        }
         tx.pragma_update(None, "user_version", 2)?;
         tx.commit()?;
         version = 2;
@@ -276,6 +609,27 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         tx.pragma_update(None, "user_version", 3)?;
         tx.commit()?;
         version = 3;
+    }
+    if version < 4 {
+        let tx = conn.unchecked_transaction()?;
+        migration_4(&tx)?;
+        tx.pragma_update(None, "user_version", 4)?;
+        tx.commit()?;
+        version = 4;
+    }
+    if version < 5 {
+        let tx = conn.unchecked_transaction()?;
+        migration_5(&tx)?;
+        tx.pragma_update(None, "user_version", 5)?;
+        tx.commit()?;
+        version = 5;
+    }
+    if version < 6 {
+        let tx = conn.unchecked_transaction()?;
+        migration_6(&tx)?;
+        tx.pragma_update(None, "user_version", 6)?;
+        tx.commit()?;
+        version = 6;
     }
     debug_assert_eq!(version, SCHEMA_VERSION, "missing migration step");
     Ok(())
@@ -323,7 +677,7 @@ pub fn insert_batch(conn: &Connection, entries: &[Entry]) -> rusqlite::Result<us
         let mut stmt = tx.prepare_cached(sql)?;
         for e in entries {
             inserted += stmt.execute(params![
-                uuid::Uuid::now_v7().to_string(),
+                uuid::Uuid::now_v7().as_bytes().to_vec(),
                 e.cmd,
                 e.cwd,
                 e.exit_code,
@@ -417,8 +771,10 @@ pub fn parse_exit_filter(raw: &str) -> Option<(bool, i64)> {
     digits.parse::<i64>().ok().map(|code| (negated, code))
 }
 
-/// Frecency-ish search. FTS5 trigram phrase when the query is matchable,
-/// LIKE fallback for 1-2 character queries (trigrams cannot match those).
+/// Frecency-ish search. FTS5 trigram phrase when the query is matchable.
+/// 1-2 character queries have two shapes: a rare/miss query probes the distinct
+/// `cmd_index`/`cwd_index` sets, while a broad query walks `idx_time` in
+/// recency order and stops at the LIMIT (no temp sort over every match).
 /// Filters: cwd subtree (`--dir` includes descendants), exit (`N` or `!N`),
 /// session, host, since (unix nanoseconds; `cmd_search` converts seconds).
 pub fn search_sql(
@@ -428,6 +784,7 @@ pub fn search_sql(
     session: Option<&str>,
     host: Option<&str>,
     since: Option<i64>,
+    short_recent: bool,
 ) -> String {
     let dir = dir.map(normalize_dir).filter(|d| !d.is_empty());
     // Only parsed integers are interpolated, so this has no injection surface.
@@ -441,20 +798,53 @@ pub fn search_sql(
             }
         });
     let fts = use_fts(query);
-    let mut sql = String::from("SELECT h.started_at, h.exit_code, h.cwd, h.cmd FROM history h ");
+    let short = !fts && !query.is_empty();
+    let indexed_short = short && !short_recent;
+    let recent_short = short && short_recent;
+    // For a rare short query, force index probes through a candidate-rowid
+    // CTE. A plain multi-index OR lets SQLite fall back to `SCAN h` when the
+    // subqueries are empty, which is exactly the 500k-row miss case.
+    let mut sql = if indexed_short {
+        String::from(
+            "WITH candidates(rowid) AS (
+               SELECT h.rowid FROM history h INDEXED BY idx_cmd_all
+                WHERE h.cmd COLLATE NOCASE IN (
+                  SELECT cmd FROM cmd_index
+                   WHERE cmd LIKE '%' || ?1 || '%' ESCAPE '\\'
+                )
+               UNION
+               SELECT h.rowid FROM history h INDEXED BY idx_cwd
+                WHERE h.cwd IN (
+                  SELECT cwd FROM cwd_index
+                   WHERE cwd LIKE '%' || ?1 || '%' ESCAPE '\\'
+                )
+             )
+             SELECT h.started_at, h.exit_code, h.cwd, h.cmd
+               FROM history h JOIN candidates c ON c.rowid = h.rowid ",
+        )
+    } else if recent_short {
+        String::from(
+            "SELECT h.started_at, h.exit_code, h.cwd, h.cmd
+               FROM history h INDEXED BY idx_time ",
+        )
+    } else {
+        String::from("SELECT h.started_at, h.exit_code, h.cwd, h.cmd FROM history h ")
+    };
     if fts {
         sql.push_str("JOIN history_fts ON history_fts.rowid = h.rowid ");
     }
     sql.push_str("WHERE 1=1 ");
     if fts {
         sql.push_str("AND history_fts MATCH ?1 ");
-    } else if !query.is_empty() {
-        // Short query: trigram FTS cannot match it, scan with LIKE instead.
+    } else if recent_short {
+        // Broad short query: recency order + LIMIT, so the index walk can
+        // stop after the first 20 matches instead of sorting all of them.
         sql.push_str(
             "AND (h.cmd LIKE '%' || ?1 || '%' ESCAPE '\\' \
-             OR h.cwd LIKE '%' || ?1 || '%' ESCAPE '\\') ",
+             OR h.cwd LIKE '%' || ?1 || '%' ESCAPE '\\') \
+             AND ?7 IS NOT NULL AND ?8 IS NOT NULL ",
         );
-    } else {
+    } else if !indexed_short {
         sql.push_str("AND ?1 IS NULL ");
     }
     if dir.is_some() {
@@ -481,6 +871,12 @@ pub fn search_sql(
     } else {
         sql.push_str(" AND ?5 IS NULL");
     }
+    if recent_short {
+        // `idx_time` includes `id`, so this is a straight index walk with no
+        // temp b-tree and an early exit at LIMIT.
+        sql.push_str(" ORDER BY h.started_at DESC, h.id DESC LIMIT ?6");
+        return sql;
+    }
     // Rank exact matches first, then prefixes, then exact-cwd affinity, and
     // finally recency. bm25 is deliberately omitted: on a 500k-row database it
     // added ~40ms to a common-token search, while this ordering keeps the
@@ -499,6 +895,39 @@ pub fn search_sql(
     sql
 }
 
+/// Above this many candidate history rows, materializing every matching rowid
+/// costs more than walking the time index. 256 is well above the 20-result
+/// limit while keeping the rare/miss index path tiny.
+const SHORT_INDEX_CANDIDATE_CAP: i64 = 257;
+
+/// `None` means there is no matching command or cwd at all, so history cannot
+/// match either; `Some(true)` selects the broad time-index path. Counting is
+/// capped at 257 rows, so a common command/cwd stops early instead of scanning
+/// the full history twice.
+fn short_match_strategy(conn: &Connection, query: &str) -> rusqlite::Result<Option<bool>> {
+    let pattern = format!("%{}%", escape_like(query));
+    let count: i64 = conn.query_row(
+        "SELECT
+           (SELECT count(*) FROM (
+              SELECT 1 FROM history h INDEXED BY idx_cmd_all
+               WHERE h.cmd COLLATE NOCASE IN (
+                 SELECT cmd FROM cmd_index WHERE cmd LIKE ?1 ESCAPE '\\'
+               ) LIMIT ?2))
+         + (SELECT count(*) FROM (
+              SELECT 1 FROM history h INDEXED BY idx_cwd
+               WHERE h.cwd IN (
+                 SELECT cwd FROM cwd_index WHERE cwd LIKE ?1 ESCAPE '\\'
+               ) LIMIT ?2))",
+        params![pattern, SHORT_INDEX_CANDIDATE_CAP],
+        |r| r.get(0),
+    )?;
+    if count == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(count >= SHORT_INDEX_CANDIDATE_CAP))
+    }
+}
+
 pub fn search(
     conn: &Connection,
     query: &str,
@@ -511,7 +940,15 @@ pub fn search(
 ) -> rusqlite::Result<Vec<(i64, i64, String, String)>> {
     let dir = dir.map(normalize_dir).filter(|d| !d.is_empty());
     let limit = limit.clamp(0, SEARCH_MAX_LIMIT);
-    let sql = search_sql(query, dir, exit_filter, session, host, since);
+    let short_recent = if !use_fts(query) && !query.is_empty() {
+        match short_match_strategy(conn, query)? {
+            Some(broad) => broad,
+            None => return Ok(Vec::new()),
+        }
+    } else {
+        false
+    };
+    let sql = search_sql(query, dir, exit_filter, session, host, since, short_recent);
     let bind_q: Option<String> = if use_fts(query) {
         Some(fts_phrase(query))
     } else if query.is_empty() {
@@ -546,7 +983,7 @@ pub fn search(
 /// Representative query plans for CI (`EXPLAIN QUERY PLAN` in gate output).
 /// Catches missing-index/schema regressions; shapes mirror search()/suggest().
 pub fn search_plan(conn: &Connection) -> rusqlite::Result<Vec<String>> {
-    let sql = search_sql("bench", None, None, None, None, None);
+    let sql = search_sql("bench", None, None, None, None, None, false);
     let full = format!("EXPLAIN QUERY PLAN {sql}");
     let mut stmt = conn.prepare(&full)?;
     let bind_q = fts_phrase("bench");
@@ -569,25 +1006,77 @@ pub fn search_plan(conn: &Connection) -> rusqlite::Result<Vec<String>> {
     rows.collect()
 }
 
+/// Query plan for the 1-2 character path; must probe `idx_cmd_all`/`idx_cwd`
+/// rather than scan `history`.
+pub fn search_short_plan(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    let sql = search_sql("00", None, None, None, None, None, false);
+    let full = format!("EXPLAIN QUERY PLAN {sql}");
+    let mut stmt = conn.prepare(&full)?;
+    let bind_q = escape_like("00");
+    let none: Option<&str> = None;
+    let rows = stmt.query_map(
+        params![
+            Some(bind_q.as_str()),
+            none,
+            none,
+            none,
+            None::<i64>,
+            20i64,
+            "00",
+            "00"
+        ],
+        |r| r.get::<_, String>(3),
+    )?;
+    rows.collect()
+}
+
+/// Query plan for a broad 1-2 character search; must walk `idx_time` and avoid
+/// a temp sort over every match.
+pub fn search_short_recent_plan(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    let sql = search_sql("c", None, None, None, None, None, true);
+    let full = format!("EXPLAIN QUERY PLAN {sql}");
+    let mut stmt = conn.prepare(&full)?;
+    let bind_q = escape_like("c");
+    let none: Option<&str> = None;
+    let rows = stmt.query_map(
+        params![
+            Some(bind_q.as_str()),
+            none,
+            none,
+            none,
+            None::<i64>,
+            20i64,
+            "c",
+            "c"
+        ],
+        |r| r.get::<_, String>(3),
+    )?;
+    rows.collect()
+}
+
 /// Frecency weight by age: a run in the last four days counts as a full use;
 /// older runs decay (4d/14d/90d buckets), so 100 runs from last year no longer
 /// drown out 10 runs from this week.
-pub const SUGGEST_SQL: &str = "SELECT cmd,
-           (100.0 * MAX(CASE WHEN cwd = ?2 THEN 1 ELSE 0 END))
-           + (10.0 * SUM(CASE WHEN cwd = ?2 THEN 1 ELSE 0 END))
-           + SUM(CASE
-               WHEN ?5 - started_at <= 345600000000000 THEN 4.0
-               WHEN ?5 - started_at <= 1209600000000000 THEN 2.0
-               WHEN ?5 - started_at <= 7776000000000000 THEN 1.0
+///
+/// This reads the precomputed aggregates only; the per-keystroke cost is the
+/// number of distinct commands sharing the prefix, never the history size.
+/// `cmd` is a NOCASE primary key, so the LIKE prefix is an index range scan.
+pub const SUGGEST_SQL: &str = "SELECT cmd_stats.cmd,
+           (100.0 * CASE WHEN d.n IS NOT NULL THEN 1 ELSE 0 END)
+           + (10.0 * COALESCE(d.n, 0))
+           + (cmd_stats.n * CASE
+               WHEN ?5 - cmd_stats.last_seen <= 345600000000000 THEN 4.0
+               WHEN ?5 - cmd_stats.last_seen <= 1209600000000000 THEN 2.0
+               WHEN ?5 - cmd_stats.last_seen <= 7776000000000000 THEN 1.0
                ELSE 0.25
              END)
            AS w,
-           max(started_at) AS last_seen
-         FROM history h
-         WHERE cmd LIKE ?1 ESCAPE '\\' AND cmd != ?4
-           AND exit_code = 0 AND sensitive = 0
-         GROUP BY cmd COLLATE NOCASE
-         ORDER BY w DESC, last_seen DESC, cmd COLLATE NOCASE
+           cmd_stats.last_seen
+         FROM cmd_stats
+         LEFT JOIN cmd_dir_stats d
+           ON d.cmd = cmd_stats.cmd AND d.cwd = ?2
+         WHERE cmd_stats.cmd LIKE ?1 ESCAPE '\\' AND cmd_stats.cmd != ?4
+         ORDER BY w DESC, cmd_stats.last_seen DESC, cmd_stats.cmd COLLATE NOCASE
          LIMIT ?3";
 
 fn now_ns() -> i64 {
@@ -601,14 +1090,17 @@ fn now_ns() -> i64 {
 /// frecency. Returns full commands (not suffixes); caller strips the typed
 /// prefix for ghost rendering.
 ///
-/// Weight is computed in a single GROUP BY pass (no correlated subqueries:
-/// those made each keystroke O(groups × rows)). Only exit-0 runs count
-/// toward frequency — failed runs must not promote a suggestion.
+/// Weight is computed from triggers-maintained aggregates (`cmd_stats` /
+/// `cmd_dir_stats`); no history scan and no per-keystroke GROUP BY. Only
+/// exit-0, non-sensitive runs count toward frequency — failed runs must not
+/// promote a suggestion.
 ///
 /// SAFETY: candidates containing control characters (ESC, newline, BEL, ...) are
 /// silently dropped. A ghost is painted raw onto the terminal every keystroke;
 /// replaying an entry like `echo -e '\e[7m..'` would fire inverse video, cursor
 /// jumps and scrolls — i.e. whole-terminal flicker plus readline desync.
+/// Destructive commands (`git push --force`, `rm -rf`, ...) are also filtered:
+/// docs/07 forbids offering footguns even when the user typed their prefix.
 pub fn suggest(
     conn: &Connection,
     buffer: &str,
@@ -627,7 +1119,8 @@ pub fn suggest_at(
     now: i64,
 ) -> rusqlite::Result<Vec<String>> {
     // Weight: same-dir hits dominate; frequency is age-decayed (recent runs
-    // count more), and last_seen breaks remaining ties.
+    // count more), and last_seen breaks remaining ties. Aggregates are already
+    // filtered to successful/non-sensitive rows by the triggers.
     // Control-tainted rows are filtered in Rust; if they crowd out clean
     // candidates, widen the over-fetch until enough clean rows are seen or the
     // prefix is exhausted. Write-time sanitization keeps new rows clean, so the
@@ -648,7 +1141,7 @@ pub fn suggest_at(
         let exhausted = (raw.len() as i64) < fetch;
         let clean: Vec<String> = raw
             .into_iter()
-            .filter(|c| !c.chars().any(|ch| ch.is_control()))
+            .filter(|c| !c.chars().any(|ch| ch.is_control()) && !crate::redact::is_destructive(c))
             .take(limit as usize)
             .collect();
         if clean.len() as i64 >= limit || exhausted {
@@ -672,9 +1165,8 @@ pub fn suggest_plan(conn: &Connection) -> rusqlite::Result<Vec<String>> {
 /// Schema objects present (tables + indexes). Gate asserts the budgeted
 /// objects exist; plans above show how the queries use them.
 pub fn schema_objects(conn: &Connection) -> rusqlite::Result<Vec<String>> {
-    let mut stmt = conn.prepare(
-        "SELECT name FROM sqlite_master WHERE type IN ('table','index') ORDER BY name",
-    )?;
+    let mut stmt = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type IN ('table','index') ORDER BY name")?;
     let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
     rows.collect()
 }
@@ -741,7 +1233,8 @@ pub fn forget(
         }
         ForgetMode::OlderThanDays(days) => {
             let cutoff = now_ns().saturating_sub(
-                (*days).max(0)
+                (*days)
+                    .max(0)
                     .saturating_mul(86_400)
                     .saturating_mul(1_000_000_000),
             );

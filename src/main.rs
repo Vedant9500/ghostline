@@ -1,13 +1,13 @@
 mod cmd_bench;
 mod cmd_daemon;
-mod cmd_forget;
-mod complete;
 mod cmd_fix;
+mod cmd_forget;
 mod cmd_import;
 mod cmd_init;
 mod cmd_log;
 mod cmd_search;
 mod cmd_suggest;
+mod complete;
 mod db;
 mod fix;
 mod queue;
@@ -275,12 +275,52 @@ mod integration {
     }
 
     #[test]
-    fn search_short_query_uses_like_fallback() {
+    fn suggest_skips_destructive_commands() {
+        let conn = memdb();
+        db::insert(&conn, &entry("git push --force origin main", "/r", 0, 100)).unwrap();
+        db::insert(&conn, &entry("git push origin main", "/r", 0, 101)).unwrap();
+        db::insert(&conn, &entry("rm -rf /tmp/build", "/r", 0, 102)).unwrap();
+        db::insert(&conn, &entry("rm notes.txt", "/r", 0, 103)).unwrap();
+        let cands = db::suggest(&conn, "git push", "/r", 5).unwrap();
+        assert_eq!(cands, vec!["git push origin main"]);
+        let cands = db::suggest(&conn, "rm", "/r", 5).unwrap();
+        assert_eq!(cands, vec!["rm notes.txt"]);
+    }
+
+    #[test]
+    fn search_short_query_uses_distinct_index() {
         let conn = memdb();
         db::insert(&conn, &entry("git status", "/r", 0, 100)).unwrap();
+        db::insert(&conn, &entry("ls -la", "/repo/alpha", 0, 101)).unwrap();
+        let plan = db::search_short_plan(&conn).unwrap().join("\n");
+        assert!(
+            plan.contains("idx_cmd_all") && !plan.contains("SCAN h"),
+            "short search must probe the distinct-command index:\n{plan}"
+        );
         let rows = db::search(&conn, "gi", 10, None, None, None, None, None).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].3, "git status");
+        // 1-2 char queries also match cwd, via cwd_index.
+        let rows = db::search(&conn, "lp", 10, None, None, None, None, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].2, "/repo/alpha");
+    }
+
+    #[test]
+    fn search_broad_short_query_walks_time_index() {
+        let conn = memdb();
+        for i in 0..300 {
+            db::insert(&conn, &entry(&format!("cmd-{i:03}"), "/r", 0, 100 + i)).unwrap();
+        }
+        let plan = db::search_short_recent_plan(&conn).unwrap().join("\n");
+        assert!(
+            plan.contains("idx_time") && !plan.contains("TEMP B-TREE"),
+            "broad short search must use idx_time without a temp sort:\n{plan}"
+        );
+        let rows = db::search(&conn, "c", 5, None, None, None, None, None).unwrap();
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[0].0, 399);
+        assert_eq!(rows[4].0, 395);
     }
 
     #[test]
@@ -302,13 +342,13 @@ mod integration {
     }
 
     #[test]
-    fn suggest_plan_uses_command_index() {
+    fn suggest_plan_uses_aggregate_table() {
         let conn = memdb();
         db::insert(&conn, &entry("git status", "/r", 0, 100)).unwrap();
         let plan = db::suggest_plan(&conn).unwrap().join("\n");
         assert!(
-            plan.contains("idx_cmd"),
-            "plan did not use idx_cmd:\n{plan}"
+            plan.contains("cmd_stats") && !plan.contains("SCAN h"),
+            "suggest must read aggregates, not history:\n{plan}"
         );
     }
 
@@ -461,9 +501,9 @@ mod integration {
         let conn = memdb();
         db::insert(&conn, &entry("first", "/r", 0, 100)).unwrap();
         db::insert(&conn, &entry("second", "/r", 0, 100)).unwrap();
-        conn.execute("UPDATE history SET id='id-a' WHERE cmd='first'", [])
+        conn.execute("UPDATE history SET id=X'01' WHERE cmd='first'", [])
             .unwrap();
-        conn.execute("UPDATE history SET id='id-b' WHERE cmd='second'", [])
+        conn.execute("UPDATE history SET id=X'02' WHERE cmd='second'", [])
             .unwrap();
         let rows = db::search(&conn, "", 10, None, None, None, None, None).unwrap();
         assert_eq!(
@@ -576,7 +616,10 @@ mod integration {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("history.db");
         assert!(db::open_read(&path).unwrap().is_none());
-        assert!(!path.exists(), "read path must not create an empty database");
+        assert!(
+            !path.exists(),
+            "read path must not create an empty database"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -601,7 +644,7 @@ mod integration {
         assert!(
             conn.execute(
                 "INSERT INTO history(id,cmd,cwd,exit_code,started_at,ended_at)
-                 VALUES('x','x','x',0,0,0)",
+                 VALUES(X'00','x','x',0,0,0)",
                 []
             )
             .is_err(),
@@ -685,7 +728,11 @@ mod integration {
         let day = 86_400_000_000_000i64;
         let now = 1_000 * day;
         for i in 0..10 {
-            db::insert(&conn, &entry("deploy old", "/other", 0, now - 100 * day + i)).unwrap();
+            db::insert(
+                &conn,
+                &entry("deploy old", "/other", 0, now - 100 * day + i),
+            )
+            .unwrap();
         }
         db::insert(&conn, &entry("deploy recent", "/other", 0, now - day)).unwrap();
         let cands = db::suggest_at(&conn, "deploy", "/repo", 5, now).unwrap();
@@ -701,9 +748,11 @@ mod integration {
         let patterns = vec!["git".to_string()];
         let report = db::forget(&conn, &db::ForgetMode::Patterns(&patterns), false).unwrap();
         assert_eq!((report.matched, report.deleted), (2, 2));
-        assert!(db::search(&conn, "git", 10, None, None, None, None, None)
-            .unwrap()
-            .is_empty());
+        assert!(
+            db::search(&conn, "git", 10, None, None, None, None, None)
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             db::search(&conn, "cargo", 10, None, None, None, None, None)
                 .unwrap()
@@ -721,13 +770,18 @@ mod integration {
         let report = db::forget(&conn, &db::ForgetMode::LastN(2), false).unwrap();
         assert_eq!(report.deleted, 2);
         let rows = db::search(&conn, "", 10, None, None, None, None, None).unwrap();
-        assert_eq!(rows.iter().map(|r| r.3.as_str()).collect::<Vec<_>>(), vec!["first"]);
+        assert_eq!(
+            rows.iter().map(|r| r.3.as_str()).collect::<Vec<_>>(),
+            vec!["first"]
+        );
 
         let report = db::forget(&conn, &db::ForgetMode::MaxRows(0), false).unwrap();
         assert_eq!(report.deleted, 1);
-        assert!(db::search(&conn, "", 10, None, None, None, None, None)
-            .unwrap()
-            .is_empty());
+        assert!(
+            db::search(&conn, "", 10, None, None, None, None, None)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -755,7 +809,10 @@ mod integration {
         let report = db::forget(&conn, &db::ForgetMode::OlderThanDays(1), false).unwrap();
         assert_eq!(report.deleted, 1);
         let rows = db::search(&conn, "", 10, None, None, None, None, None).unwrap();
-        assert_eq!(rows.iter().map(|r| r.3.as_str()).collect::<Vec<_>>(), vec!["fresh"]);
+        assert_eq!(
+            rows.iter().map(|r| r.3.as_str()).collect::<Vec<_>>(),
+            vec!["fresh"]
+        );
     }
 
     #[test]
@@ -870,6 +927,175 @@ mod integration {
         ];
         crate::cmd_search::run(&args).unwrap();
         assert!(!path.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn suggestion_aggregates_track_updates_and_deletes() {
+        let conn = memdb();
+        db::insert(&conn, &entry("deploy app", "/r", 0, 100)).unwrap();
+        db::insert(&conn, &entry("deploy app", "/r", 0, 101)).unwrap();
+        db::insert(&conn, &entry("deploy app", "/s", 0, 102)).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT n FROM cmd_stats WHERE cmd='deploy app'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(n, 3);
+        let dir_n: i64 = conn
+            .query_row(
+                "SELECT n FROM cmd_dir_stats WHERE cmd='deploy app' AND cwd='/r'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dir_n, 2);
+
+        conn.execute("DELETE FROM history WHERE started_at=102", [])
+            .unwrap();
+        let n: i64 = conn
+            .query_row("SELECT n FROM cmd_stats WHERE cmd='deploy app'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(n, 2);
+        let stale_dirs: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM cmd_dir_stats WHERE cwd='/s'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale_dirs, 0);
+
+        conn.execute("UPDATE history SET exit_code=1 WHERE started_at=100", [])
+            .unwrap();
+        let n: i64 = conn
+            .query_row("SELECT n FROM cmd_stats WHERE cmd='deploy app'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(n, 1);
+
+        conn.execute(
+            "UPDATE history SET cmd='deploy prod' WHERE started_at=101",
+            [],
+        )
+        .unwrap();
+        assert!(db::suggest(&conn, "deploy a", "/r", 5).unwrap().is_empty());
+        assert_eq!(
+            db::suggest(&conn, "deploy p", "/r", 5).unwrap(),
+            vec!["deploy prod"]
+        );
+
+        conn.execute("DELETE FROM history", []).unwrap();
+        assert!(db::suggest(&conn, "deploy", "/r", 5).unwrap().is_empty());
+        let rows: i64 = conn
+            .query_row("SELECT count(*) FROM cmd_stats", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn migration_v3_rebuilds_text_ids_external_fts_and_stats() {
+        let dir = std::env::temp_dir().join(format!("gl-migrate-v3-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE history(
+                   id TEXT PRIMARY KEY, cmd TEXT NOT NULL, cwd TEXT NOT NULL,
+                   exit_code INTEGER NOT NULL, duration_ns INTEGER NOT NULL DEFAULT 0,
+                   started_at INTEGER NOT NULL, ended_at INTEGER NOT NULL,
+                   hostname TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL DEFAULT '',
+                   shell TEXT NOT NULL DEFAULT '', tty TEXT, ssh_ctx TEXT, tmux TEXT,
+                   container TEXT, sudo_user TEXT, git_repo TEXT, git_branch TEXT,
+                   sensitive INTEGER NOT NULL DEFAULT 0, import_key TEXT
+                 ) STRICT;
+                 CREATE INDEX idx_time ON history(started_at DESC);
+                 CREATE INDEX idx_cwd ON history(cwd, started_at DESC);
+                 CREATE INDEX idx_session ON history(session_id, started_at);
+                 CREATE INDEX idx_cmd ON history(cmd COLLATE NOCASE, cwd, started_at DESC)
+                   WHERE exit_code = 0 AND sensitive = 0;
+                 CREATE UNIQUE INDEX idx_import_key ON history(import_key)
+                   WHERE import_key IS NOT NULL;
+                 CREATE VIRTUAL TABLE history_fts USING fts5(cmd, cwd, tokenize='trigram');
+                 CREATE TRIGGER history_ai AFTER INSERT ON history BEGIN
+                   INSERT INTO history_fts(rowid, cmd, cwd) VALUES (new.rowid, new.cmd, new.cwd);
+                 END;
+                 CREATE TRIGGER history_ad AFTER DELETE ON history BEGIN
+                   DELETE FROM history_fts WHERE rowid = old.rowid;
+                 END;
+                 CREATE TRIGGER history_au AFTER UPDATE ON history BEGIN
+                   DELETE FROM history_fts WHERE rowid = old.rowid;
+                   INSERT INTO history_fts(rowid, cmd, cwd) VALUES (new.rowid, new.cmd, new.cwd);
+                 END;
+                 INSERT INTO history(id,cmd,cwd,exit_code,started_at,ended_at)
+                   VALUES('0190a5b4-1c2d-7e3f-8a9b-0c1d2e3f4a5b',
+                          'legacy command','/old',0,100,100);
+                 PRAGMA user_version=3;",
+            )
+            .unwrap();
+        }
+
+        let conn = db::open(&path).unwrap();
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, db::SCHEMA_VERSION);
+        let (kind, len): (String, i64) = conn
+            .query_row("SELECT typeof(id), length(id) FROM history", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((kind.as_str(), len), ("blob", 16));
+        let fts_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name='history_fts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            fts_sql.contains("content='history'"),
+            "FTS must be external-content: {fts_sql}"
+        );
+        let time_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name='idx_time'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            time_sql.contains("id DESC"),
+            "v6 must rebuild idx_time to include id: {time_sql}"
+        );
+        assert_eq!(
+            db::search(&conn, "legacy", 10, None, None, None, None, None)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            db::search(&conn, "ga", 10, None, None, None, None, None)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            db::suggest(&conn, "leg", "/old", 5).unwrap(),
+            vec!["legacy command"]
+        );
+        conn.execute("DELETE FROM history", []).unwrap();
+        assert!(
+            db::search(&conn, "legacy", 10, None, None, None, None, None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(db::suggest(&conn, "leg", "/old", 5).unwrap().is_empty());
+        drop(conn);
         std::fs::remove_dir_all(&dir).ok();
     }
 

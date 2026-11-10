@@ -2,7 +2,7 @@
 
 ## Privacy model: local-first
 
-- Default: logging local-only, DB and its WAL/SHM sidecars `chmod 600` (`~/.local/share/ghostline/history.db`), data dir `0700`, cache `~/.cache/ghostline/`, no sockets in default path, no telemetry, no auto-update phone-home.
+- Default: logging local-only, DB and its WAL/SHM sidecars `chmod 600` (`~/.local/share/ghostline/history.db`), data dir `0700`, cache `~/.cache/ghostline/`, no sockets in default path, no telemetry, no auto-update phone-home. Directory/chmod failures print `ghostline: warning: …` to stderr rather than being silently swallowed, so a failed privacy guarantee is visible.
 - Opt-in only: NL cache, cloud fallback, multi-machine sync (E2EE when built). Everything clearable: `ghostline forget <pattern>`, `--last-n`, `--older-than`, `--max-rows`, `--all`, and `--forget` (NL cache). `--dry-run` previews matches; `--vacuum` reclaims pages after deletion.
 - Never store wholesale `env`, raw IPs, or full `/proc`. Allowlist (`SHELL,TERM,HOSTNAME,USER,TZ,LANG`) + hashed projections. `ssh_ctx` = hash, not IP.
 - CLI args also leak via `ps`/`/proc`/auditd/scrollback — history redaction covers disk only. Document defense-in-depth: prefer env-var / secret-manager / interactive `-p` over CLI args.
@@ -16,11 +16,13 @@ Core patterns (from gitleaks/Warp core; full integration later):
 - `sk-[A-Za-z0-9]{48}` (OpenAI), `sk-ant-…{80,120}`, `ghp_|gho_|ghu_|ghs_|github_pat_`, `AKIA[A-Z0-9]{16}`, `AIza[0-9A-Za-z-_]{35}`, `xox[bpa]-…`, `rk_|sk_(live|test)_…`, JWT `ey[…]\.[…]\.[…]`, `-----BEGIN .*PRIVATE KEY-----`.
 - Generic: `(?i)(password|passwd|pwd|secret|token|api[_-]?key|auth)[\s=:]+[^\s]+`, `--password\s+\S+`, `Bearer\s+[^\s]+`, `(postgres|mysql|mongodb|redis)://[^:@]+:[^@]+@`.
 - Replace with `[REDACTED]` preserving key name. Custom `rules.conf` (`regex|||replacement`), allowlist/blocklist, per-project `.ghostlineignore`.
-- Also suppress from ghost suggestions: never suggest `sensitive=1` rows or `git push --force` style footguns (fish/atuin leak lesson). `GHOSTLINE_IGNORE="*password* *secret* *token*"` mirrors `HISTIGNORE`.
+- Also suppress from ghost suggestions: never suggest `sensitive=1` rows or destructive shapes (fish/atuin leak lesson). `redact::is_destructive` filters force-pushes (`--force`, `-f`, `+refspec`, `--mirror`, `--delete`), `git reset --hard`, `git clean -f*`, `git branch -D`, `rm -r/-f`, `rmdir`, recursive `chmod … 777`, `dd of=`, `mkfs*`, shutdown/reboot/halt, and fork bombs. Suppression applies to suggestions only; matching rows remain searchable. `GHOSTLINE_IGNORE="*password* *secret* *token*"` mirrors `HISTIGNORE`, and a leading space skips logging.
 
 Later: full gitleaks ruleset (200+), reversible tokenization, per-project `.wick.yaml`-style config, audit log.
 
-## Destructive-command tiers (authoritative, fail-closed)
+## Destructive-command tiers (design; pre-exec guard not shipped)
+
+The shipped build uses the token-boundary classifier in `redact::is_destructive` to suppress ghost suggestions only. The confirmation/pre-exec tier behavior below is design, not current runtime behavior: nothing is auto-executed, but `ghostline` also does not intercept a typed destructive command yet.
 
 Tokenize with shell-aware lexer: respect quotes; unwrap `sudo/doas`, `env/timeout/nice`, `sh -c "…"`, `xargs`/`find -exec`, `|/&&/||/;/$( )` recursively. Token-boundary match (so `iptables -L` stays SAFE). Parse error → treat as CAUTION minimum. Never trust model `isDangerous=false`.
 

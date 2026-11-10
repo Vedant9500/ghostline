@@ -12,13 +12,13 @@ It is for people who want faster history recall and inline correction without a 
 
 - `ghostline log` records one row per command: command, cwd, exit code, timestamp, hostname, session, shell, and sensitive flag. Commands are whitespace-normalized, capped at 8 KiB, and self-commands (`ghostline ...`) are skipped.
 - Hooks come from `ghostline init bash|zsh|fish`. Bash uses `PROMPT_COMMAND` plus `history 1`; zsh uses `preexec`/`precmd`; fish uses `fish_postexec`.
-- Storage is SQLite in WAL mode with a `history` table, time/cwd/session/prefix indexes, and an FTS5 virtual table with insert/update/delete triggers. The database, its WAL/SHM sidecars, and the `ghostline` data directory are private (`0600`/`0700`).
+- Storage is SQLite in WAL mode with a `history` table (16-byte UUIDv7 primary key), time/cwd/session/prefix indexes, an external-content FTS5 trigram index, and trigger-maintained suggestion/short-search tables. The database, its WAL/SHM sidecars, and the `ghostline` data directory are private (`0600`/`0700`); permission failures print a warning instead of being silently ignored.
 - An optional JSONL ingest queue (`log --queue` or `GHOSTLINE_QUEUE=1`) is drained by `ghostline daemon` in batches of 500 rows.
 - `ghostline import` reads a bash-style `HISTFILE`, including `#<unix-seconds>` timestamps. Re-importing the same file is idempotent via a stable per-line key; `--no-dedupe` forces a fresh copy.
 
 **Ghost suggestions (bash)**
 
-- History suggestions are prefix matches ranked by exact-cwd affinity and age-decayed frecency: a run in the last four days counts as a full use, older runs decay through 14- and 90-day buckets. Only successful, non-sensitive commands are candidates, and candidates containing control characters are dropped.
+- History suggestions are prefix matches ranked by exact-cwd affinity and age-decayed frecency: a run in the last four days counts as a full use, older runs decay through 14- and 90-day buckets. Only successful, non-sensitive commands are candidates; candidates containing control characters or destructive shapes (`git push --force`, `git reset --hard`, `rm -rf`, and similar) are dropped. Counts come from precomputed aggregate tables, so a keystroke does not scan history.
 - When no history matches and the buffer is one token, lookup falls back to executable names on `PATH` plus shell builtins.
 - The default bash hook paints an on-demand dim suffix. `Ctrl-G` previews, `Right`/`Ctrl-F`/`End` accept at end of line, `Alt-Right`/`Alt-F` accept one word, and `Ctrl-]` dismisses.
 - The optional loadable bash builtin (`builtin/ghostline_autosuggest.c`) hooks readline's redisplay and paints the suffix automatically on every keypress without a full-line refresh.
@@ -31,11 +31,11 @@ It is for people who want faster history recall and inline correction without a 
 
 **Search and diagnostics**
 
-- `ghostline search` uses FTS5 trigram phrase matching for queries of at least three characters, with a `LIKE` fallback for shorter queries. Results rank exact matches first, then prefix matches, exact-cwd affinity, and recency. Filters cover cwd (including subdirectories), exit status (`N` or `!N`), session, host, and timestamp. Output is tab-separated: timestamp (Unix ns), exit code, cwd, command.
+- `ghostline search` uses FTS5 trigram phrase matching for queries of at least three characters. For 1-2 character queries, rare/miss searches probe distinct command/cwd sets, while broad searches walk the time index in recency order and stop at the limit. Results rank exact matches first, then prefix matches, exact-cwd affinity, and recency (broad short queries use recency order). Filters cover cwd (including subdirectories), exit status (`N` or `!N`), session, host, and timestamp. Output is tab-separated: timestamp (Unix ns), exit code, cwd, command.
 - `search`, `suggest`, and `fix` open an existing database read-only with a 100 ms busy timeout; they skip schema work and never create an empty database just because a read ran.
 - `ghostline forget` deletes by pattern, newest N (`--last-n`), age (`--older-than DAYS`), or keeps only the newest N (`--max-rows`); `--dry-run` previews and `--vacuum` reclaims space. New databases use incremental auto-vacuum.
 - No fzf/skim binding or `Ctrl-R` hijack is installed.
-- `ghostline bench` reports log/search/suggest/hook percentiles, inserts per second, BUSY count, WAL and DB sizes, binary size, RSS, and schema presence. `--gate` exits non-zero when a budget is exceeded or a query plan loses its FTS/index path; `--json` emits a machine-readable report.
+- `ghostline bench` reports log/rare-search/common-search/short-search/suggest/hook percentiles, inserts per second, BUSY count, WAL and DB sizes, binary size, RSS, and schema presence. `--gate` exits non-zero when a budget is exceeded or a query plan loses its FTS/index path; `--json` emits a machine-readable report. A scheduled `bench-500k` CI job runs the full 500k-row gate.
 
 ### Roadmap / not yet implemented
 
@@ -134,7 +134,7 @@ With the shell ghost, `Ctrl-G` previews; `Right`/`Ctrl-F`/`End` accept at end of
  optional bash builtin: readline redisplay --> ghostline suggest
 ```
 
-The CLI is a small Rust binary with hand-rolled argument parsing and bundled SQLite. The schema stores a UUIDv7 id, command, cwd, exit code, timestamps, host, session, and shell, plus context columns (`tty`, `ssh_ctx`, `tmux`, `container`, `sudo_user`, `git_repo`, `git_branch`) that the current hooks do not populate.
+The CLI is a small Rust binary with hand-rolled argument parsing and bundled SQLite. The schema stores a 16-byte UUIDv7 id, command, cwd, exit code, timestamps, host, session, and shell, plus context columns (`tty`, `ssh_ctx`, `tmux`, `container`, `sudo_user`, `git_repo`, `git_branch`) that the current hooks do not populate. Aggregates for suggestions and distinct-value sets for short searches are maintained by history triggers.
 
 The queue is one append-only JSONL file. The daemon renames it to claim it, skips malformed lines, inserts 500-row chunks, and checkpoints WAL. The bash hook asks `suggest` for a suffix; the native builtin caches the candidate and forks only on divergence. Redaction runs before rows are persisted.
 
@@ -149,6 +149,8 @@ Targets from [docs/08-performance-budgets.md](docs/08-performance-budgets.md):
 | Fork + exec `ghostline log` | ~0.8–1.5 ms |
 | Prompt render delta | ≤ 2 ms total, p99 < 5 ms |
 | Search, 20 results, 500k rows | ≤ 50 ms for FTS rare/miss terms; ranked common tokens may exceed |
+| Short search, 1–2 chars, 500k rows | ≤ 50 ms for both rare/miss and broad queries |
+| Suggest, 500k rows / 4k distinct commands | ≤ 50 ms p50 |
 | Daemon batch, 500 rows | ≤ 100 ms background, 0 ms foreground |
 
 `bench --gate` defaults enforced in `src/cmd_bench.rs`, all overridable:
@@ -157,25 +159,27 @@ Targets from [docs/08-performance-budgets.md](docs/08-performance-budgets.md):
 |---|---|
 | Log p99 | ≤ 5 ms |
 | Search p50 | ≤ 50 ms |
+| Short search p50 (rare, miss, broad) | ≤ 50 ms |
 | Suggest p50 | ≤ 50 ms |
 | Hook p99 | ≤ 100 ms |
 | Throughput | ≥ 2000 inserts/s |
-| Schema objects | `history`, `history_fts`, `idx_cmd`, `idx_time`, `idx_cwd`, `idx_session` |
+| Schema objects | `history`, `history_fts`, `cmd_stats`, `cmd_dir_stats`, `cmd_index`, `cwd_index`, `idx_cmd`, `idx_cmd_all`, `idx_time`, `idx_cwd`, `idx_session` |
+| Query plans | FTS + primary-key lookup, `idx_cmd_all`/`idx_time` short paths, `cmd_stats` suggest |
 
 ```bash
 ghostline bench --gate
 ghostline bench --n 50000 --reps 20 --json --gate
 ```
 
-Search uses trigram FTS for three-character-and-longer queries and a `LIKE` fallback for shorter ones.
+Search uses trigram FTS for three-character-and-longer queries. Short queries use row-capped distinct-value index probes when rare and an early-exit time-index walk when broad.
 
 ## Privacy and security
 
 - Local-first: no sockets, telemetry, accounts, auto-update, or network calls in the default path.
 - The database defaults to `$XDG_DATA_HOME/ghostline/history.db` or `~/.local/share/ghostline/history.db`; the database and its WAL/SHM sidecars are chmod `0600`, and the data directory is chmod `0700`. The queue file defaults to `$XDG_CACHE_HOME/ghostline/queue/history.jsonl` or `~/.cache/ghostline/queue/history.jsonl`.
 - Redaction runs before persistence for `log` and `import`. Rules cover common token formats (OpenAI, Anthropic, GitHub, AWS, Google, Slack, Stripe), JWTs, PEM private keys, database URLs with passwords, `curl -u`, and password/token/key/value patterns. Matches are replaced and the row is marked `sensitive=1`.
-- `GHOSTLINE_IGNORE` excludes matching commands from `log`; `GHOSTLINE_DISABLED` pauses logging and ghost painting. Suggestions never execute; `fix` only prints candidates. `ghostline forget` deletes rows and their FTS entries; `--vacuum` reclaims free pages.
-- Redaction is best-effort, not a guarantee. Sensitive rows are excluded from suggestions; the database and its WAL/SHM sidecars are chmodded `0600`, and the data directory is chmodded `0700`.
+- `GHOSTLINE_IGNORE` excludes matching commands from `log`; a leading space also skips logging (HISTCONTROL `ignorespace` behavior). `GHOSTLINE_DISABLED` pauses logging and ghost painting. Suggestions never execute and suppress destructive shapes such as force-pushes, hard resets, and recursive deletes; `fix` only prints candidates. `ghostline forget` deletes rows and their FTS/aggregate entries; `--vacuum` reclaims free pages.
+- Redaction is best-effort, not a guarantee. Sensitive rows are excluded from suggestions; the database and its WAL/SHM sidecars are chmodded `0600`, and the data directory is chmodded `0700`. If a chmod or directory creation fails, `ghostline` prints a warning to stderr rather than claiming the file is private.
 
 ## Configuration
 
@@ -205,7 +209,7 @@ cargo clippy --all-targets
 
 - `cargo test` runs unit and integration tests. The pty end-to-end tests in `tests/pty.rs` use `python3` when available and skip otherwise.
 - The native builtin test builds `builtin/ghostline_autosuggest.c` with `cc`; it skips when the compiler or bash headers are missing. `make -C builtin` builds it independently.
-- CI in `.github/workflows/perf.yml` runs `cargo test`, a release build, and `ghostline bench --gate` on pushes and pull requests, with a larger seed in the weekly Ubuntu/macOS matrix.
+- CI in `.github/workflows/perf.yml` runs `cargo test`, a release build, and `ghostline bench --gate` on pushes and pull requests, with a larger seed in the weekly Ubuntu/macOS matrix and a scheduled/dispatch 500k-row gate.
 
 ## Project layout
 

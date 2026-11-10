@@ -67,6 +67,20 @@ pub fn clean_command(cmd: &str) -> String {
         .join(" ")
 }
 
+/// Truncate to at most `max_bytes` without splitting a UTF-8 character.
+/// `String::truncate` panics on a non-boundary, so never call it with a raw
+/// byte count taken from `len()`.
+pub fn truncate_utf8(s: &mut String, max_bytes: usize) {
+    if s.len() <= max_bytes {
+        return;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+}
+
 /// Tiny glob matcher supporting `*` (used for GHOSTLINE_IGNORE, comma/space separated).
 pub fn glob_match(pattern: &str, text: &str) -> bool {
     let p: Vec<u8> = pattern.bytes().collect();
@@ -92,6 +106,127 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
         pi += 1;
     }
     pi == p.len()
+}
+
+/// True for commands whose suggestion would be a footgun (docs/07). The list
+/// is deliberately conservative but over-matching is safer than offering a
+/// destructive command: these are only suppressed from ghost suggestions,
+/// never removed from history or search.
+pub fn is_destructive(cmd: &str) -> bool {
+    let lower = cmd.to_ascii_lowercase();
+    let tokens: Vec<&str> = cmd.split_whitespace().collect();
+    let lower_tokens: Vec<String> = tokens.iter().map(|t| t.to_ascii_lowercase()).collect();
+    let has = |needle: &str| lower_tokens.iter().any(|t| t == needle);
+    let has_prefix = |prefix: &str| lower_tokens.iter().any(|t| t.starts_with(prefix));
+
+    if lower.contains(":(){") || lower.contains(":|:&") {
+        return true; // fork bomb
+    }
+    if has_prefix("mkfs") || has("shutdown") || has("reboot") || has("poweroff") || has("halt") {
+        return true;
+    }
+
+    for i in 0..tokens.len() {
+        match lower_tokens[i].as_str() {
+            "git" => {
+                let rest = &lower_tokens[i + 1..];
+                let mut j = 0;
+                while j < rest.len() && rest[j].starts_with('-') {
+                    // Options that take a separate value.
+                    if matches!(rest[j].as_str(), "-c" | "-C" | "--git-dir" | "--work-tree") {
+                        j += 1;
+                    }
+                    j += 1;
+                }
+                if j >= rest.len() {
+                    continue;
+                }
+                let args = &rest[j + 1..];
+                match rest[j].as_str() {
+                    "push" => {
+                        if args.iter().any(|a| {
+                            a == "-f"
+                                || a == "-d"
+                                || a.starts_with("--force")
+                                || matches!(
+                                    a.as_str(),
+                                    "--mirror" | "--delete" | "--prune" | "--prune=now"
+                                )
+                                // `git push origin +main` force-updates a ref.
+                                || a.starts_with('+')
+                        }) {
+                            return true;
+                        }
+                    }
+                    "reset" => {
+                        if args.iter().any(|a| a == "--hard") {
+                            return true;
+                        }
+                    }
+                    "clean" => {
+                        if args.iter().any(|a| {
+                            a == "--force"
+                                || a.strip_prefix('-')
+                                    .map(|f| !f.starts_with('-') && f.contains('f'))
+                                    .unwrap_or(false)
+                        }) {
+                            return true;
+                        }
+                    }
+                    "branch" => {
+                        let raw = &tokens[i + 1 + j + 1..];
+                        if raw.contains(&"-D")
+                            || (args.iter().any(|a| a == "--delete")
+                                && args.iter().any(|a| a == "--force"))
+                        {
+                            return true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            "rm" | "rmdir" => {
+                if lower_tokens[i].as_str() == "rmdir" {
+                    return true;
+                }
+                let mut recursive = false;
+                let mut force = false;
+                for arg in &tokens[i + 1..] {
+                    if let Some(flags) = arg.strip_prefix('-') {
+                        if let Some(long) = flags.strip_prefix('-') {
+                            recursive |= long == "recursive";
+                            force |= long == "force";
+                        } else {
+                            recursive |= flags.contains('r') || flags.contains('R');
+                            force |= flags.contains('f');
+                        }
+                    }
+                }
+                if recursive || force {
+                    return true;
+                }
+            }
+            "chmod" => {
+                let args = &tokens[i + 1..];
+                let recursive = args.iter().any(|a| {
+                    *a == "--recursive"
+                        || a.strip_prefix('-')
+                            .map(|f| !f.starts_with('-') && (f.contains('R') || f.contains('r')))
+                            .unwrap_or(false)
+                });
+                if recursive && args.iter().any(|a| *a == "777" || *a == "0777") {
+                    return true;
+                }
+            }
+            "dd" => {
+                if lower_tokens[i + 1..].iter().any(|a| a.starts_with("of=")) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// True if cmd matches any pattern in GHOSTLINE_IGNORE (or legacy HISTIGNORE-style ` ` prefix).
@@ -175,5 +310,45 @@ mod tests {
         assert!(is_ignored(" secret export FOO=1", None));
         assert!(is_ignored("export AWS_SECRET=1", Some("*SECRET*")));
         assert!(!is_ignored("git status", Some("*SECRET*")));
+    }
+
+    #[test]
+    fn truncate_utf8_never_splits_a_character() {
+        let mut s = format!("{}é{}", "a".repeat(8191), "z".repeat(10));
+        truncate_utf8(&mut s, 8192);
+        assert_eq!(s, "a".repeat(8191));
+        let mut s = String::from("ééé");
+        truncate_utf8(&mut s, 5);
+        assert_eq!(s, "éé");
+        let mut s = String::from("short");
+        truncate_utf8(&mut s, 99);
+        assert_eq!(s, "short");
+    }
+
+    #[test]
+    fn destructive_suggestions_are_detected() {
+        assert!(is_destructive("git push --force origin main"));
+        assert!(is_destructive("git push -f origin main"));
+        assert!(is_destructive("git push --force-with-lease"));
+        assert!(is_destructive("git push origin +main"));
+        assert!(is_destructive("git push --mirror origin"));
+        assert!(is_destructive("git push -d origin old"));
+        assert!(is_destructive("git reset --hard HEAD~1"));
+        assert!(is_destructive("git clean -fdx"));
+        assert!(is_destructive("git branch -D old"));
+        assert!(is_destructive("rm -rf /tmp/x"));
+        assert!(is_destructive("rm -fr /tmp/x"));
+        assert!(is_destructive("rm -f notes.txt"));
+        assert!(is_destructive("sudo rm -rf /tmp/x"));
+        assert!(is_destructive("chmod -R 777 /"));
+        assert!(is_destructive("dd if=/dev/zero of=/dev/sda"));
+        assert!(is_destructive("shutdown -h now"));
+        assert!(is_destructive(":(){ :|:& };:"));
+        assert!(!is_destructive("git push origin main"));
+        assert!(!is_destructive("git reset HEAD file"));
+        assert!(!is_destructive("git clean -n"));
+        assert!(!is_destructive("git branch -d merged"));
+        assert!(!is_destructive("rm notes.txt"));
+        assert!(!is_destructive("chmod 644 notes.txt"));
     }
 }

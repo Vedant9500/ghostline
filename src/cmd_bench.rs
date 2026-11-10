@@ -47,8 +47,22 @@ pub struct BenchReport {
     pub log_ms_p50: f64,
     pub log_ms_p99: f64,
     pub inserts_per_s: f64,
+    /// Budgeted rare-term search (FTS).
     pub search_ms_p50: f64,
     pub search_ms_p99: f64,
+    /// Common-token search, reported for regressions but not budgeted by
+    /// docs/08 (it can legitimately exceed 50ms at 500k rows).
+    pub search_common_ms_p50: f64,
+    pub search_common_ms_p99: f64,
+    /// 1-2 character rare search with matches (distinct-value index probe).
+    pub search_short_ms_p50: f64,
+    pub search_short_ms_p99: f64,
+    /// 1-2 character miss (short-circuits before touching history).
+    pub search_short_miss_ms_p50: f64,
+    pub search_short_miss_ms_p99: f64,
+    /// 1-2 character broad search (time-index walk, early exit).
+    pub search_short_common_ms_p50: f64,
+    pub search_short_common_ms_p99: f64,
     pub suggest_ms_p50: f64,
     pub suggest_ms_p99: f64,
     pub hook_ms_p50: f64,
@@ -61,6 +75,8 @@ pub struct BenchReport {
     pub rss_kb: u64,
     pub indexes_ok: bool,
     pub search_plan_ok: bool,
+    pub search_short_plan_ok: bool,
+    pub search_short_recent_plan_ok: bool,
     pub suggest_plan_ok: bool,
 }
 
@@ -82,8 +98,17 @@ fn pct(mut v: Vec<f64>, p: f64) -> f64 {
 
 fn bench_entry(i: usize) -> db::Entry {
     db::Entry {
-        cmd: format!("cmd-{} run {}", i % 50, i),
-        cwd: format!("/r/{}", i % 7),
+        // The review's 500k corpus is 4,000 distinct long-tail commands repeated
+        // across rows, not 500k unique strings. Keeping the distinct count
+        // realistic is what lets a prefix suggestion rank in bounded time.
+        // Row 0 gets a rare cwd so the short-search index path has a non-empty
+        // selective query to measure.
+        cmd: format!("cmd-{}", i % 4_000),
+        cwd: if i == 0 {
+            "/rare-dir".to_string()
+        } else {
+            format!("/r/{}", i % 7)
+        },
         exit_code: if i % 10 == 9 { 1 } else { 0 },
         duration_ns: 0,
         started_at: 1_700_000_000 + i as i64,
@@ -182,20 +207,51 @@ pub fn run(opts: &BenchOpts) -> Result<BenchReport, String> {
     // Give the planner realistic stats before measuring/asserting plans.
     db::analyze(&conn).map_err(|e| format!("analyze: {e}"))?;
 
-    // Query latencies over seeded rows.
+    // Query latencies over seeded rows. The budgeted search is a rare term
+    // (docs/08); common tokens are reported separately because they match a
+    // large fraction of the corpus and have no 50ms promise. Short searches
+    // cover the three shapes: rare (`ra`), miss (`zz`), and broad (`c`).
     let reps = opts.reps.max(1);
+    let rare_query = format!("cmd-{}", opts.n.saturating_sub(1) % 4_000);
     let mut search_ms = Vec::with_capacity(reps);
     for _ in 0..reps {
         let t = Instant::now();
-        let _ = db::search(&conn, "cmd-1", 20, None, None, None, None, None)
+        let _ = db::search(&conn, &rare_query, 20, None, None, None, None, None)
             .map_err(|e| format!("search: {e}"))?;
         search_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    let mut search_common_ms = Vec::with_capacity(reps);
+    for _ in 0..reps {
+        let t = Instant::now();
+        let _ = db::search(&conn, "cmd-1", 20, None, None, None, None, None)
+            .map_err(|e| format!("search common: {e}"))?;
+        search_common_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    let mut search_short_ms = Vec::with_capacity(reps);
+    for _ in 0..reps {
+        let t = Instant::now();
+        let _ = db::search(&conn, "ra", 20, None, None, None, None, None)
+            .map_err(|e| format!("search short: {e}"))?;
+        search_short_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    let mut search_short_miss_ms = Vec::with_capacity(reps);
+    for _ in 0..reps {
+        let t = Instant::now();
+        let _ = db::search(&conn, "zz", 20, None, None, None, None, None)
+            .map_err(|e| format!("search short miss: {e}"))?;
+        search_short_miss_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    let mut search_short_common_ms = Vec::with_capacity(reps);
+    for _ in 0..reps {
+        let t = Instant::now();
+        let _ = db::search(&conn, "c", 20, None, None, None, None, None)
+            .map_err(|e| format!("search short common: {e}"))?;
+        search_short_common_ms.push(t.elapsed().as_secs_f64() * 1000.0);
     }
     let mut suggest_ms = Vec::with_capacity(reps);
     for _ in 0..reps {
         let t = Instant::now();
-        let _ = db::suggest(&conn, "cmd-1", "/r/1", 5)
-            .map_err(|e| format!("suggest: {e}"))?;
+        let _ = db::suggest(&conn, "cmd-1", "/r/1", 5).map_err(|e| format!("suggest: {e}"))?;
         suggest_ms.push(t.elapsed().as_secs_f64() * 1000.0);
     }
 
@@ -229,7 +285,11 @@ pub fn run(opts: &BenchOpts) -> Result<BenchReport, String> {
         }
         (pct(hook_ms.clone(), 50.0), pct(hook_ms, 99.0), true)
     } else {
-        (pct(suggest_ms.clone(), 50.0), pct(suggest_ms.clone(), 99.0), false)
+        (
+            pct(suggest_ms.clone(), 50.0),
+            pct(suggest_ms.clone(), 99.0),
+            false,
+        )
     };
 
     // Concurrency contention: threads × rows, busy_timeout=0 surfaces BUSY.
@@ -280,15 +340,36 @@ pub fn run(opts: &BenchOpts) -> Result<BenchReport, String> {
     let db_bytes = file_bytes(&dbp);
     let binary_bytes = file_bytes(&exe);
     let objs = db::schema_objects(&conn).map_err(|e| format!("schema: {e}"))?;
-    let need = ["history", "history_fts", "idx_cmd", "idx_cwd", "idx_session", "idx_time"];
+    let need = [
+        "history",
+        "history_fts",
+        "cmd_stats",
+        "cmd_dir_stats",
+        "cmd_index",
+        "cwd_index",
+        "idx_cmd",
+        "idx_cmd_all",
+        "idx_cwd",
+        "idx_session",
+        "idx_time",
+    ];
     let indexes_ok = need.iter().all(|n| objs.iter().any(|o| o == n));
     let search_plan = db::search_plan(&conn).map_err(|e| format!("search plan: {e}"))?;
+    let search_short_plan =
+        db::search_short_plan(&conn).map_err(|e| format!("short search plan: {e}"))?;
+    let search_short_recent_plan =
+        db::search_short_recent_plan(&conn).map_err(|e| format!("short recent plan: {e}"))?;
     let suggest_plan = db::suggest_plan(&conn).map_err(|e| format!("suggest plan: {e}"))?;
     let search_plan_ok = plan_contains(&search_plan, "history_fts")
         && plan_contains(&search_plan, "INTEGER PRIMARY KEY")
         && !plan_scans_history(&search_plan);
-    let suggest_plan_ok =
-        plan_contains(&suggest_plan, "idx_cmd") && !plan_scans_history(&suggest_plan);
+    let search_short_plan_ok =
+        plan_contains(&search_short_plan, "idx_cmd_all") && !plan_scans_history(&search_short_plan);
+    let search_short_recent_plan_ok = plan_contains(&search_short_recent_plan, "idx_time")
+        && !plan_contains(&search_short_recent_plan, "TEMP B-TREE");
+    let suggest_plan_ok = plan_contains(&suggest_plan, "cmd_stats")
+        && !plan_contains(&suggest_plan, "SCAN cmd_stats")
+        && !plan_scans_history(&suggest_plan);
 
     let report = BenchReport {
         n: opts.n,
@@ -299,6 +380,14 @@ pub fn run(opts: &BenchOpts) -> Result<BenchReport, String> {
         inserts_per_s,
         search_ms_p50: pct(search_ms.clone(), 50.0),
         search_ms_p99: pct(search_ms, 99.0),
+        search_common_ms_p50: pct(search_common_ms.clone(), 50.0),
+        search_common_ms_p99: pct(search_common_ms, 99.0),
+        search_short_ms_p50: pct(search_short_ms.clone(), 50.0),
+        search_short_ms_p99: pct(search_short_ms, 99.0),
+        search_short_miss_ms_p50: pct(search_short_miss_ms.clone(), 50.0),
+        search_short_miss_ms_p99: pct(search_short_miss_ms, 99.0),
+        search_short_common_ms_p50: pct(search_short_common_ms.clone(), 50.0),
+        search_short_common_ms_p99: pct(search_short_common_ms, 99.0),
         suggest_ms_p50: pct(suggest_ms.clone(), 50.0),
         suggest_ms_p99: pct(suggest_ms, 99.0),
         hook_ms_p50,
@@ -311,6 +400,8 @@ pub fn run(opts: &BenchOpts) -> Result<BenchReport, String> {
         rss_kb: rss_kb(),
         indexes_ok,
         search_plan_ok,
+        search_short_plan_ok,
+        search_short_recent_plan_ok,
         suggest_plan_ok,
     };
 
@@ -333,17 +424,50 @@ pub fn check_gate(report: &BenchReport, opts: &BenchOpts) -> Vec<GateCheck> {
         GateCheck {
             name: "inserts_per_s",
             ok: report.inserts_per_s >= opts.min_inserts_per_s,
-            detail: format!("{:.0}/s >= {:.0}/s", report.inserts_per_s, opts.min_inserts_per_s),
+            detail: format!(
+                "{:.0}/s >= {:.0}/s",
+                report.inserts_per_s, opts.min_inserts_per_s
+            ),
         },
         GateCheck {
             name: "search_ms_p50",
             ok: report.search_ms_p50 <= opts.max_search_ms,
-            detail: format!("{:.3}ms <= {:.3}ms", report.search_ms_p50, opts.max_search_ms),
+            detail: format!(
+                "{:.3}ms <= {:.3}ms",
+                report.search_ms_p50, opts.max_search_ms
+            ),
+        },
+        GateCheck {
+            name: "search_short_ms_p50",
+            ok: report.search_short_ms_p50 <= opts.max_search_ms,
+            detail: format!(
+                "{:.3}ms <= {:.3}ms",
+                report.search_short_ms_p50, opts.max_search_ms
+            ),
+        },
+        GateCheck {
+            name: "search_short_miss_ms_p50",
+            ok: report.search_short_miss_ms_p50 <= opts.max_search_ms,
+            detail: format!(
+                "{:.3}ms <= {:.3}ms",
+                report.search_short_miss_ms_p50, opts.max_search_ms
+            ),
+        },
+        GateCheck {
+            name: "search_short_common_ms_p50",
+            ok: report.search_short_common_ms_p50 <= opts.max_search_ms,
+            detail: format!(
+                "{:.3}ms <= {:.3}ms",
+                report.search_short_common_ms_p50, opts.max_search_ms
+            ),
         },
         GateCheck {
             name: "suggest_ms_p50",
             ok: report.suggest_ms_p50 <= opts.max_suggest_ms,
-            detail: format!("{:.3}ms <= {:.3}ms", report.suggest_ms_p50, opts.max_suggest_ms),
+            detail: format!(
+                "{:.3}ms <= {:.3}ms",
+                report.suggest_ms_p50, opts.max_suggest_ms
+            ),
         },
         GateCheck {
             name: "hook_ms_p99",
@@ -353,7 +477,7 @@ pub fn check_gate(report: &BenchReport, opts: &BenchOpts) -> Vec<GateCheck> {
         GateCheck {
             name: "indexes",
             ok: report.indexes_ok,
-            detail: "history, history_fts, idx_cmd, idx_time, idx_cwd, idx_session present".into(),
+            detail: "history, history_fts, stats/index tables + budgeted indexes present".into(),
         },
         GateCheck {
             name: "search_plan",
@@ -361,9 +485,19 @@ pub fn check_gate(report: &BenchReport, opts: &BenchOpts) -> Vec<GateCheck> {
             detail: "history_fts + INTEGER PRIMARY KEY, no base-table scan".into(),
         },
         GateCheck {
+            name: "search_short_plan",
+            ok: report.search_short_plan_ok,
+            detail: "idx_cmd_all probe, no base-table scan".into(),
+        },
+        GateCheck {
+            name: "search_short_recent_plan",
+            ok: report.search_short_recent_plan_ok,
+            detail: "idx_time walk, no temp sort".into(),
+        },
+        GateCheck {
             name: "suggest_plan",
             ok: report.suggest_plan_ok,
-            detail: "idx_cmd SEARCH, no base-table scan".into(),
+            detail: "cmd_stats primary-key SEARCH, no base-table scan".into(),
         },
     ]
 }
@@ -432,6 +566,14 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
         for row in db::search_plan(&pc).map_err(|e| format!("search plan: {e}"))? {
             plan_lines.push(format!("search:  {row}"));
         }
+        for row in db::search_short_plan(&pc).map_err(|e| format!("short search plan: {e}"))? {
+            plan_lines.push(format!("short:   {row}"));
+        }
+        for row in
+            db::search_short_recent_plan(&pc).map_err(|e| format!("short recent plan: {e}"))?
+        {
+            plan_lines.push(format!("short-r: {row}"));
+        }
         for row in db::suggest_plan(&pc).map_err(|e| format!("suggest plan: {e}"))? {
             plan_lines.push(format!("suggest: {row}"));
         }
@@ -457,20 +599,61 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
         });
         println!("{}", serde_json::to_string_pretty(&payload).unwrap());
     } else {
-        println!("ghostline bench: n={} reps={} concurrency={}", opts.n, opts.reps, opts.concurrency);
-        println!("  log_ms        p50 {:8.3}  p99 {:8.3}", report.log_ms_p50, report.log_ms_p99);
+        println!(
+            "ghostline bench: n={} reps={} concurrency={}",
+            opts.n, opts.reps, opts.concurrency
+        );
+        println!(
+            "  log_ms        p50 {:8.3}  p99 {:8.3}",
+            report.log_ms_p50, report.log_ms_p99
+        );
         println!("  inserts_per_s {:8.0}", report.inserts_per_s);
-        println!("  search_ms     p50 {:8.3}  p99 {:8.3}", report.search_ms_p50, report.search_ms_p99);
-        println!("  suggest_ms    p50 {:8.3}  p99 {:8.3}", report.suggest_ms_p50, report.suggest_ms_p99);
+        println!(
+            "  search_ms     p50 {:8.3}  p99 {:8.3}  (rare term)",
+            report.search_ms_p50, report.search_ms_p99
+        );
+        println!(
+            "  search_common p50 {:8.3}  p99 {:8.3}",
+            report.search_common_ms_p50, report.search_common_ms_p99
+        );
+        println!(
+            "  search_short  p50 {:8.3}  p99 {:8.3}  (rare)",
+            report.search_short_ms_p50, report.search_short_ms_p99
+        );
+        println!(
+            "  short_miss    p50 {:8.3}  p99 {:8.3}",
+            report.search_short_miss_ms_p50, report.search_short_miss_ms_p99
+        );
+        println!(
+            "  short_common  p50 {:8.3}  p99 {:8.3}",
+            report.search_short_common_ms_p50, report.search_short_common_ms_p99
+        );
+        println!(
+            "  suggest_ms    p50 {:8.3}  p99 {:8.3}",
+            report.suggest_ms_p50, report.suggest_ms_p99
+        );
         println!(
             "  hook_ms{}      p50 {:8.3}  p99 {:8.3}",
-            if report.hook_subprocess { " (fork+exec)" } else { " (in-proc fallback)" },
+            if report.hook_subprocess {
+                " (fork+exec)"
+            } else {
+                " (in-proc fallback)"
+            },
             report.hook_ms_p50,
             report.hook_ms_p99
         );
-        println!("  busy_count    {:8}  (concurrency {})", report.busy_count, opts.concurrency);
-        println!("  wal_bytes     {:8}  db_bytes {:8}", report.wal_bytes, report.db_bytes);
-        println!("  binary_bytes  {:8}  rss_kb {:8}", report.binary_bytes, report.rss_kb);
+        println!(
+            "  busy_count    {:8}  (concurrency {})",
+            report.busy_count, opts.concurrency
+        );
+        println!(
+            "  wal_bytes     {:8}  db_bytes {:8}",
+            report.wal_bytes, report.db_bytes
+        );
+        println!(
+            "  binary_bytes  {:8}  rss_kb {:8}",
+            report.binary_bytes, report.rss_kb
+        );
         println!("  indexes_ok    {}", report.indexes_ok);
         if opts.gate {
             println!("gate query plans (representative shapes):");
@@ -478,7 +661,12 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
                 println!("  {line}");
             }
             for c in &gate_checks {
-                println!("gate {:<15} {} ({})", c.name, if c.ok { "PASS" } else { "FAIL" }, c.detail);
+                println!(
+                    "gate {:<15} {} ({})",
+                    c.name,
+                    if c.ok { "PASS" } else { "FAIL" },
+                    c.detail
+                );
             }
         }
     }
@@ -512,8 +700,22 @@ mod tests {
         assert!(r.log_ms_p99 >= r.log_ms_p50);
         assert!(r.indexes_ok, "budgeted schema objects must exist");
         assert!(r.search_plan_ok, "search plan must use the FTS join");
-        assert!(r.suggest_plan_ok, "suggest plan must use idx_cmd");
-        assert!(!r.hook_subprocess, "cargo test harness is not the ghostline binary");
+        assert!(
+            r.search_short_plan_ok,
+            "short search must probe idx_cmd_all"
+        );
+        assert!(
+            r.search_short_recent_plan_ok,
+            "broad short search must walk idx_time"
+        );
+        assert!(r.suggest_plan_ok, "suggest plan must use cmd_stats");
+        assert!(r.search_short_ms_p50 >= 0.0);
+        assert!(r.search_short_miss_ms_p50 >= 0.0);
+        assert!(r.search_short_common_ms_p50 >= 0.0);
+        assert!(
+            !r.hook_subprocess,
+            "cargo test harness is not the ghostline binary"
+        );
     }
 
     #[test]
@@ -554,6 +756,14 @@ mod tests {
             inserts_per_s: 5000.0,
             search_ms_p50: 1.0,
             search_ms_p99: 2.0,
+            search_common_ms_p50: 1.0,
+            search_common_ms_p99: 2.0,
+            search_short_ms_p50: 1.0,
+            search_short_ms_p99: 2.0,
+            search_short_miss_ms_p50: 1.0,
+            search_short_miss_ms_p99: 2.0,
+            search_short_common_ms_p50: 1.0,
+            search_short_common_ms_p99: 2.0,
             suggest_ms_p50: 1.0,
             suggest_ms_p99: 2.0,
             hook_ms_p50: 2.0,
@@ -566,6 +776,8 @@ mod tests {
             rss_kb: 0,
             indexes_ok: true,
             search_plan_ok: true,
+            search_short_plan_ok: true,
+            search_short_recent_plan_ok: true,
             suggest_plan_ok: true,
         };
         assert!(check_gate(&r, &o).iter().any(|c| !c.ok));
@@ -610,9 +822,23 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let conn = db::open(&dir.join("p.db")).unwrap();
         assert!(!db::search_plan(&conn).unwrap().is_empty());
+        assert!(!db::search_short_plan(&conn).unwrap().is_empty());
+        assert!(!db::search_short_recent_plan(&conn).unwrap().is_empty());
         assert!(!db::suggest_plan(&conn).unwrap().is_empty());
         let objs = db::schema_objects(&conn).unwrap();
-        for need in ["history", "history_fts", "idx_cmd", "idx_time", "idx_cwd", "idx_session"] {
+        for need in [
+            "history",
+            "history_fts",
+            "cmd_stats",
+            "cmd_dir_stats",
+            "cmd_index",
+            "cwd_index",
+            "idx_cmd",
+            "idx_cmd_all",
+            "idx_time",
+            "idx_cwd",
+            "idx_session",
+        ] {
             assert!(objs.contains(&need.to_string()), "missing {need}: {objs:?}");
         }
         std::fs::remove_dir_all(&dir).ok();

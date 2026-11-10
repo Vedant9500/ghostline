@@ -16,7 +16,7 @@ Pragmas: `journal_mode=WAL; synchronous=NORMAL; temp_store=MEMORY; busy_timeout=
 
 ## Storage
 
-Primary: **SQLite WAL single file** `~/.local/share/ghostline/history.db`. 0.1–0.5ms single-row (NORMAL + prepared + single txn), 20–50k/s batched, 500k-row FTS query <20ms, 1 writer + N readers, crash-safe. Precedent: atuin, zsh-histdb, browsers.
+Primary: **SQLite WAL single file** `~/.local/share/ghostline/history.db`. 0.1–0.5ms single-row (NORMAL + prepared + single txn), 20–50k/s batched, 500k-row rare/miss search ≤50ms, 1 writer + N readers, crash-safe. Precedent: atuin, zsh-histdb, browsers.
 
 Rejected for v1 primary: append-JSONL alone (fast `O_APPEND` 0.05ms but O(n) scan, needs sidecar index + compaction), sled/redb/heed (KV-only, manual FTS, crash/maturity + mapsize pain). Hybrid accepted: JSONL as **ingest queue** (`~/.cache/ghostline/queue/$SESSION.jsonl`) tailed by daemon → batch INSERT (500/1s) → CHECKPOINT + FTS.
 
@@ -29,8 +29,9 @@ PRAGMA synchronous=NORMAL;
 PRAGMA busy_timeout=5000;
 PRAGMA foreign_keys=ON;
 
+-- Design view: columns/tables marked reserved are not in the shipped v6 schema.
 CREATE TABLE history(
-  id TEXT PRIMARY KEY,          -- UUIDv7 (time-ordered, merge-friendly)
+  id BLOB PRIMARY KEY,          -- 16-byte UUIDv7 (time-ordered, merge-friendly)
   cmd TEXT NOT NULL,            -- redacted
   cwd TEXT NOT NULL,
   exit_code INTEGER NOT NULL,
@@ -47,33 +48,55 @@ CREATE TABLE history(
   sudo_user TEXT,
   git_repo TEXT,                -- hook-provided, no git call in hot path
   git_branch TEXT,
-  nix_ctx TEXT,
+  nix_ctx TEXT,                 -- reserved; not populated yet
   sensitive INTEGER NOT NULL DEFAULT 0,
-  created_seq INTEGER,          -- lamport clock for sync tiebreak
+  created_seq INTEGER,          -- reserved lamport clock for sync tiebreak
   import_key TEXT               -- stable key for idempotent HISTFILE imports
 ) STRICT;
-CREATE INDEX idx_time ON history(started_at DESC);
+-- `id` is part of the time index so a broad 1-2 char search can walk it in
+-- recency order and stop at LIMIT without a temp sort.
+CREATE INDEX idx_time ON history(started_at DESC, id DESC);
 CREATE INDEX idx_cwd ON history(cwd, started_at DESC);
 CREATE INDEX idx_session ON history(session_id, started_at);
-CREATE INDEX idx_host_session ON history(hostname, session_id);
--- Covering partial index for per-keystroke ghost suggestions.
+-- Full non-partial index used as a covering probe for short searches.
+CREATE INDEX idx_cmd_all ON history(cmd COLLATE NOCASE, started_at DESC);
 CREATE INDEX idx_cmd ON history(cmd COLLATE NOCASE, cwd, started_at DESC)
   WHERE exit_code = 0 AND sensitive = 0;
 CREATE UNIQUE INDEX idx_import_key ON history(import_key)
   WHERE import_key IS NOT NULL;
 
-CREATE VIRTUAL TABLE history_fts USING fts5(cmd, cwd, tokenize='trigram');
+-- External-content FTS: the index stores only postings, not a second copy of
+-- cmd/cwd. Delete/update use the special 'delete' command.
+CREATE VIRTUAL TABLE history_fts USING fts5(
+  cmd, cwd, content='history', content_rowid='rowid', tokenize='trigram'
+);
 CREATE TRIGGER history_ai AFTER INSERT ON history BEGIN
   INSERT INTO history_fts(rowid, cmd, cwd) VALUES (new.rowid, new.cmd, new.cwd);
 END;
 CREATE TRIGGER history_ad AFTER DELETE ON history BEGIN
-  DELETE FROM history_fts WHERE rowid = old.rowid;
+  INSERT INTO history_fts(history_fts, rowid, cmd, cwd)
+    VALUES ('delete', old.rowid, old.cmd, old.cwd);
 END;
 CREATE TRIGGER history_au AFTER UPDATE ON history BEGIN
-  DELETE FROM history_fts WHERE rowid = old.rowid;
+  INSERT INTO history_fts(history_fts, rowid, cmd, cwd)
+    VALUES ('delete', old.rowid, old.cmd, old.cwd);
   INSERT INTO history_fts(rowid, cmd, cwd) VALUES (new.rowid, new.cmd, new.cwd);
 END;
 
+-- Per-keystroke suggestion aggregates. Only successful, non-sensitive rows
+-- count. Triggers maintain them; suggest never scans history.
+CREATE TABLE cmd_stats(
+  cmd TEXT PRIMARY KEY COLLATE NOCASE, n INTEGER NOT NULL, last_seen INTEGER NOT NULL
+) STRICT, WITHOUT ROWID;
+CREATE TABLE cmd_dir_stats(
+  cmd TEXT COLLATE NOCASE, cwd TEXT, n INTEGER NOT NULL, last_seen INTEGER NOT NULL,
+  PRIMARY KEY(cmd, cwd)
+) STRICT, WITHOUT ROWID;
+-- Distinct values for 1-2 character substring searches.
+CREATE TABLE cmd_index(cmd TEXT PRIMARY KEY COLLATE NOCASE) STRICT, WITHOUT ROWID;
+CREATE TABLE cwd_index(cwd TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+
+-- Reserved for sync/session work; v6 does not create these yet.
 CREATE TABLE sessions(
   session_id TEXT PRIMARY KEY,
   hostname TEXT NOT NULL, pid INTEGER NOT NULL,
@@ -85,11 +108,13 @@ CREATE TABLE sync_state(
 );
 ```
 
-Notes: cap `cmd` ~8KB (overflow → blob table or `truncated=1`); never store `env` wholesale (hashed allowlist only); UUIDv7 + `(started_at, device_id)` = merge order without server. Schema version is stored in `PRAGMA user_version` (currently 3); `db::open` applies the baseline DDL and versioned steps only when upgrading and refuses databases written by a newer version. `ghostline import` runs `ANALYZE` after bulk loads, and the daemon runs `PRAGMA optimize` after each batch.
+Notes: cap `cmd` ~8KB (overflow → blob table or `truncated=1`); never store `env` wholesale (hashed allowlist only); UUIDv7 + `(started_at, device_id)` = merge order without server. Schema version is stored in `PRAGMA user_version` (currently 6); `db::open` applies the baseline DDL and versioned steps only when upgrading and refuses databases written by a newer version. `ghostline import` runs `ANALYZE` after bulk loads, and the daemon runs `PRAGMA optimize` after each batch.
+
+The `id` column is a 16-byte BLOB, so the primary key and `idx_time` do not store a 36-byte UUID string. The FTS table is external-content, and `cmd_stats`/`cmd_dir_stats` hold the exact successful, non-sensitive counts used by `suggest`; `cmd_index`/`cwd_index` hold distinct command/cwd values for short searches. Triggers on `history` maintain all four. Migration v3→v4 regenerates malformed TEXT UUIDs as BLOB v7 IDs, v4→v5 backfills aggregates/index sets, and v5→v6 rebuilds `idx_time` to cover `id`.
 
 Read paths (`search`, `suggest`, `fix`) use `open_read`: a read-only connection, `PRAGMA query_only`, and a 100 ms busy timeout. A current `user_version` skips all DDL; an older database falls back to the writable migration path. A missing database returns no rows instead of creating an empty file.
 
-Batch inserts use `BEGIN IMMEDIATE` so writers queue on the RESERVED lock instead of both reading and then fighting over the upgrade. Suggestion weights decay by age (4/14/90-day buckets), and search orders exact matches, prefixes, exact-cwd affinity, then recency. `forget` deletes rows (FTS triggers follow) and runs `PRAGMA incremental_vacuum`, or a full `VACUUM` with `--vacuum`.
+Batch inserts use `BEGIN IMMEDIATE` so writers queue on the RESERVED lock instead of both reading and then fighting over the upgrade. Suggestion weights read the aggregates and decay by age (4/14/90-day buckets); destructive commands are filtered before display. Search orders exact matches, prefixes, exact-cwd affinity, then recency. A 1-2 character query is row-capped against the distinct-value sets: rare/miss queries probe `idx_cmd_all`/`idx_cwd`, while a broad query walks `idx_time` and stops at the limit. `forget` deletes rows (FTS and aggregate triggers follow) and runs `PRAGMA incremental_vacuum`, or a full `VACUUM` with `--vacuum`.
 
 ## Shell integration
 

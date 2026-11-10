@@ -35,6 +35,90 @@ fn log(db: &std::path::Path, cwd: &str, exit: &str, cmd: &str) {
 }
 
 #[test]
+fn fix_last_refuses_sensitive_history() {
+    let dir = std::env::temp_dir().join(format!("gl-fix-sensitive-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("history.db");
+    let cwd = dir.to_string_lossy().into_owned();
+
+    log(
+        &db,
+        &cwd,
+        "1",
+        "curl --password hunter2 https://example.test",
+    );
+
+    let out = Command::new(bin())
+        .env_remove("GHOSTLINE_IGNORE")
+        .args(["fix", "--last", "--db"])
+        .arg(&db)
+        .output()
+        .expect("run ghostline fix");
+    assert!(!out.status.success(), "sensitive fix should fail closed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stdout.contains("hunter2"));
+    assert!(!stderr.contains("hunter2"));
+    assert!(!stdout.contains("did you mean"), "got: {stdout}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn fix_refuses_a_sensitive_explicit_command() {
+    let dir =
+        std::env::temp_dir().join(format!("gl-fix-sensitive-explicit-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("missing.db");
+    let cwd = dir.to_string_lossy().into_owned();
+
+    let out = Command::new(bin())
+        .env_remove("GHOSTLINE_IGNORE")
+        .args(["fix", "--db"])
+        .arg(&db)
+        .args([
+            "--cwd",
+            &cwd,
+            "--",
+            "curl",
+            "--password",
+            "hunter2",
+            "https://example.test",
+        ])
+        .output()
+        .expect("run ghostline fix");
+    assert!(!out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stdout.contains("hunter2"));
+    assert!(!stderr.contains("hunter2"));
+    assert!(!stdout.contains("did you mean"), "got: {stdout}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn fix_does_not_correct_a_successful_command() {
+    let dir = std::env::temp_dir().join(format!("gl-fix-exit0-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("Downloads")).unwrap();
+    let db = dir.join("missing.db");
+    let cwd = dir.to_string_lossy().into_owned();
+
+    let out = Command::new(bin())
+        .env_remove("GHOSTLINE_IGNORE")
+        .args(["fix", "--db"])
+        .arg(&db)
+        .args(["--cwd", &cwd, "--exit", "0", "--", "ls", "-la", "downloads"])
+        .output()
+        .expect("run ghostline fix");
+    assert!(!out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("did you mean"), "got: {stdout}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn fix_last_does_not_learn_from_its_own_failure() {
     let dir = std::env::temp_dir().join(format!("gl-fix-last-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

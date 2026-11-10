@@ -1,4 +1,4 @@
-use crate::{db, fix};
+use crate::{db, fix, redact};
 
 /// `ghostline fix [--last] [--exit CODE] [--cwd DIR] [--db P] [-q] [command...]`
 /// Prints up to 3 `did you mean` candidates (human format), or just the top
@@ -40,19 +40,22 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let conn = db::open_read(&path).map_err(|e| format!("open db: {e}"))?;
 
     // Resolve target command: explicit args, or most recent non-zero-exit row.
-    let (cmd, cwd, _exit) = if last {
-        let row: Option<(String, String, i64)> = match &conn {
+    let (cmd, cwd, exit, sensitive) = if last {
+        let row: Option<(String, String, i64, i64)> = match &conn {
             Some(conn) => {
                 let mut stmt = conn
-                    .prepare("SELECT cmd, cwd, exit_code FROM history WHERE exit_code != 0 ORDER BY started_at DESC, id DESC LIMIT 1")
+                    .prepare("SELECT cmd, cwd, exit_code, sensitive FROM history WHERE exit_code != 0 ORDER BY started_at DESC, id DESC LIMIT 1")
                     .map_err(|e| format!("query last failure: {e}"))?;
-                stmt.query_row([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                stmt.query_row([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
                     .ok()
             }
             None => None,
         };
         match row {
-            Some(r) => r,
+            Some((cmd, cwd, exit, sensitive)) => {
+                let sensitive = sensitive != 0 || redact::redact(&cmd).1;
+                (cmd, cwd, Some(exit), sensitive)
+            }
             None => {
                 println!("no failed commands in history");
                 std::process::exit(1);
@@ -62,14 +65,21 @@ pub fn run(args: &[String]) -> Result<(), String> {
         if cmd_parts.is_empty() {
             return Err("usage: ghostline fix [--last] [command...]".into());
         }
-        let c = cwd.clone();
-        (cmd_parts.join(" "), c, exit_code.unwrap_or(1))
+        let cmd = cmd_parts.join(" ");
+        let sensitive = redact::redact(&cmd).1;
+        (cmd, cwd.clone(), exit_code, sensitive)
     };
     let cwd = if cwd.is_empty() {
         std::env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()
     } else {
         cwd
     };
+    if sensitive {
+        if !quiet {
+            println!("no suggestion for a sensitive command");
+        }
+        std::process::exit(1);
+    }
 
     // History context for verb/flag learning: recent successful, non-sensitive
     // commands sharing the first token, excluding the command being repaired.
@@ -92,10 +102,10 @@ pub fn run(args: &[String]) -> Result<(), String> {
         None => Vec::new(),
     };
 
-    let cands = fix::suggest(&cmd, &cwd, &history);
+    let cands = fix::suggest_with_exit(&cmd, &cwd, &history, exit);
     if cands.is_empty() {
         if !quiet {
-            println!("no suggestion for: {cmd}");
+            println!("no suggestion for: {}", redact::strip_controls(&cmd));
         }
         std::process::exit(1);
     }

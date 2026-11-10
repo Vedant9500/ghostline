@@ -10,6 +10,8 @@
 The five changes with the highest payoff are: fix the multi-component path contract (F-01), stop learning from the failed row itself (F-02), make Rule 0 and git parsing conservative (F-03/F-04), replace whitespace splitting with shell-aware tokenisation (F-05/F-06), and enforce the sensitive/exit/destructive policy before wiring any run action (F-07/F-08).
 
 > **Follow-up (2026-11-10):** F-01 and F-02 were fixed after this review. `missing_components` now returns the ordered missing suffix and Rule 3 reconstructs and verifies the full path; the history query now excludes failed, sensitive, and current rows, and `suggest` filters the typed token/flag from its pools. `cargo test --all-targets` now passes 100 unit, 1 fix integration, and 3 pty tests. The rest of this document is the pre-fix analysis for the outstanding findings, so line numbers may have shifted slightly.
+>
+> **High-severity follow-up (2026-11-10):** F-03–F-08 are now fixed in the working tree. Rule 0 is limited to the explicit `checkout git …` shape and no longer suppresses Rule 1 for assignments, reserved words, or wrappers; git global options, `--`, creation flags, and path operands are parsed conservatively; path and flag operands are separated; candidates use a shell-word lexer with raw-token preservation and safe quoting; non-zero exit and sensitive-history gates are enforced; and destructive candidates are suppressed. Regression tests cover each high finding. `cargo test --all-targets` passes 110 unit, 4 fix integration, and 3 pty tests.
 
 ## How this was reviewed
 
@@ -722,4 +724,4 @@ mkdir -p "$D/-Downloads"
 $BIN fix --db "$D/h.db" --cwd "$D" 'cd -downloads'
 ```
 
-All reproductions were run against the pre-fix debug binary; the timing table used the release binary. F-01 and F-02 are now fixed in the working tree; the remaining findings were not addressed by that patch.
+All reproductions were run against the pre-fix debug binary; the timing table used the release binary. F-01–F-08 are now fixed in the working tree; the remaining findings were not addressed by those patches.

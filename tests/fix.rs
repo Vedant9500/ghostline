@@ -148,3 +148,100 @@ fn fix_last_does_not_learn_from_its_own_failure() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+fn run_fix(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
+    let db = std::env::temp_dir().join(format!(
+        "gl-fix-cli-db-{}-{}",
+        std::process::id(),
+        dir.file_name().unwrap().to_string_lossy()
+    ));
+    Command::new(bin())
+        .env_remove("GHOSTLINE_IGNORE")
+        .env_remove("GHOSTLINE_QUEUE")
+        .args(["fix", "--db"])
+        .arg(&db)
+        .args(["--cwd", &dir.to_string_lossy()])
+        .args(args)
+        .output()
+        .expect("run ghostline fix")
+}
+
+#[test]
+fn fix_mkdir_does_not_repeat_the_original_command() {
+    let dir = std::env::temp_dir().join(format!("gl-fix-mkdir-cli-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let out = run_fix(&dir, &["--", "mkdir", "a/b"]);
+    assert!(out.status.success(), "fix failed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("mkdir -p a/b"), "got: {stdout}");
+    assert!(!stdout.contains("&&"), "duplicate command: {stdout}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn fix_cp_trailing_slash_target_creates_the_directory() {
+    let dir = std::env::temp_dir().join(format!("gl-fix-cp-cli-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("file"), "x").unwrap();
+
+    let out = run_fix(&dir, &["--", "cp", "file", "newdir/"]);
+    assert!(out.status.success(), "fix failed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("mkdir -p newdir && cp file newdir/"),
+        "got: {stdout}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn fix_cd_rejects_a_regular_file() {
+    let dir = std::env::temp_dir().join(format!("gl-fix-cd-file-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("Downloads"), "not a directory").unwrap();
+
+    let out = run_fix(&dir, &["--", "cd", "downloads"]);
+    assert!(!out.status.success(), "file should not be suggested");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("did you mean"), "got: {stdout}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn fix_ties_are_deterministic_across_processes() {
+    let dir = std::env::temp_dir().join(format!("gl-fix-ties-cli-{}", std::process::id()));
+    let bins = dir.join("bin");
+    std::fs::create_dir_all(&bins).unwrap();
+    for name in ["fooa", "foob"] {
+        let path = bins.join(name);
+        std::fs::write(&path, "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    let db = dir.join("missing.db");
+    let mut answers = std::collections::BTreeSet::new();
+    for _ in 0..8 {
+        let out = Command::new(bin())
+            .env_remove("GHOSTLINE_IGNORE")
+            .env_remove("GHOSTLINE_QUEUE")
+            .env("PATH", bins.as_os_str())
+            .args(["fix", "--db"])
+            .arg(&db)
+            .args(["--cwd", &dir.to_string_lossy(), "-q", "--", "fooo"])
+            .output()
+            .expect("run ghostline fix");
+        assert!(out.status.success(), "fix failed");
+        answers.insert(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    }
+    assert_eq!(answers.len(), 1, "nondeterministic answers: {answers:?}");
+    assert_eq!(answers.first().map(String::as_str), Some("fooa"));
+
+    std::fs::remove_dir_all(&dir).ok();
+}

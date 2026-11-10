@@ -1,11 +1,21 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::redact;
 
+/// Longest single word we will fuzzy-match. Command and path names are far
+/// shorter; the cap keeps a pathological token from allocating a huge matrix.
+const MAX_WORD_LEN: usize = 200;
+
+/// Upper bound on names collected from `PATH`, matching `complete.rs`.
+const MAX_PATH_BINS: usize = 20_000;
+
 /// Optimal string alignment distance (Damerau-Levenshtein restricted to
 /// adjacent transpositions). Case-insensitive: caller lowercases first;
 /// exact-but-for-case matches are handled as distance 0 by callers.
+///
+/// Uses three rolling rows: the transposition step only needs `d[i-2]`, so
+/// memory is O(m) rather than O(n*m).
 pub fn osa(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
@@ -16,28 +26,28 @@ pub fn osa(a: &str, b: &str) -> usize {
     if m == 0 {
         return n;
     }
-    let mut d = vec![vec![0usize; m + 1]; n + 1];
-    for i in 0..=n {
-        d[i][0] = i;
-    }
-    for j in 0..=m {
-        d[0][j] = j;
-    }
+    let mut prev2 = vec![0usize; m + 1];
+    let mut prev: Vec<usize> = (0..=m).collect();
     for i in 1..=n {
+        let mut cur = vec![0usize; m + 1];
+        cur[0] = i;
         for j in 1..=m {
-            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
-            d[i][j] = (d[i - 1][j] + 1).min(d[i][j - 1] + 1).min(d[i - 1][j - 1] + cost);
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
             if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
-                d[i][j] = d[i][j].min(d[i - 2][j - 2] + 1);
+                cur[j] = cur[j].min(prev2[j - 2] + 1);
             }
         }
+        prev2 = std::mem::replace(&mut prev, cur);
     }
-    d[n][m]
+    prev[m]
 }
 
 /// Git-style proportional threshold: reject if distance > max(2, len/3).
+/// Counts characters, not bytes, so non-ASCII words are not treated as
+/// longer than they are.
 pub fn within_threshold(typed: &str, dist: usize) -> bool {
-    dist <= (2usize.max(typed.len() / 3))
+    dist <= 2usize.max(typed.chars().count() / 3)
 }
 
 /// Adjacent-transposition check: same length, exactly one swapped adjacent pair.
@@ -48,39 +58,78 @@ fn is_transposition(a: &str, b: &str) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    let diffs: Vec<usize> = a.iter().zip(b.iter()).enumerate().filter(|(_, (x, y))| x != y).map(|(i, _)| i).collect();
-    diffs.len() == 2 && diffs[1] == diffs[0] + 1 && a[diffs[0]] == b[diffs[1]] && a[diffs[1]] == b[diffs[0]]
+    let mut first = None;
+    let mut second = None;
+    let mut diffs = 0;
+    for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+        if x != y {
+            diffs += 1;
+            match diffs {
+                1 => first = Some(i),
+                2 => second = Some(i),
+                _ => return false,
+            }
+        }
+    }
+    match (first, second) {
+        (Some(i), Some(j)) => j == i + 1 && a[i] == b[j] && a[j] == b[i],
+        _ => false,
+    }
 }
 
 /// Best candidate within threshold, case-insensitive.
-/// Tie-breaks: history membership (user's own vocabulary) → transposition → shorter distance → order.
+/// Tie-breaks: exact case-fold → history membership → transposition → shorter
+/// distance → lexicographic name. The final name tie-break makes output stable
+/// regardless of the order in which the candidate pool was collected.
 pub fn best<'a>(
     typed: &str,
     candidates: impl IntoIterator<Item = &'a str>,
     preferred: &HashSet<&str>,
 ) -> Option<&'a str> {
     let lower = typed.to_lowercase();
-    // (exact_fold desc, preferred desc, transposition desc, dist asc)
-    let mut best: Option<(&str, bool, bool, bool, usize)> = None;
+    let typed_len = lower.chars().count();
+    if typed_len == 0 || typed_len > MAX_WORD_LEN {
+        return None;
+    }
+    let threshold = 2usize.max(typed_len / 3);
+    let mut best: Option<(&'a str, String, bool, bool, bool, usize)> = None;
     for c in candidates {
+        if c.is_empty() {
+            continue;
+        }
         let cl = c.to_lowercase();
+        let cand_len = cl.chars().count();
+        // Cheap prefilter before the OSA matrix: a length difference larger
+        // than the threshold can never be within it.
+        if cand_len > MAX_WORD_LEN || typed_len.abs_diff(cand_len) > threshold {
+            continue;
+        }
         let d = osa(&lower, &cl);
         if !within_threshold(&lower, d) {
             continue;
         }
-        let key = (cl == lower, preferred.contains(c), is_transposition(&lower, &cl), d);
-        let take = match best {
+        let key = (
+            cl == lower,
+            preferred.contains(c),
+            is_transposition(&lower, &cl),
+        );
+        let take = match &best {
             None => true,
-            Some((_, bex, bpref, btrans, bd)) => {
-                let (ex, pref, trans, _) = key;
-                (ex, pref, trans, bd.saturating_sub(d)) > (bex, bpref, btrans, 0)
+            Some((_, best_name, bex, bpref, btrans, bd)) => {
+                if key != (*bex, *bpref, *btrans) {
+                    key > (*bex, *bpref, *btrans)
+                } else if d != *bd {
+                    d < *bd
+                } else {
+                    cl.as_str() < best_name.as_str()
+                }
             }
         };
         if take {
-            best = Some((c, key.0, key.1, key.2, d));
+            best = Some((c, cl, key.0, key.1, key.2, d));
         }
     }
-    best.map(|(c, _, _, _, _)| c)
+    best.map(|(c, _, _, _, _, _)| c)
 }
 
 const SHELL_BUILTINS: &[&str] = &[
@@ -128,32 +177,69 @@ pub fn history_verbs(history: &[String]) -> Vec<&str> {
     out
 }
 
-/// Is `prog` runnable (PATH lookup or builtin)? Used to decide if token[0] is a typo.
-pub fn known_command(prog: &str, path_bins: &HashSet<String>) -> bool {
+/// Is `prog` runnable (PATH lookup, builtin, or executable path)? Used to
+/// decide if token[0] is a typo. Relative paths resolve against `cwd`, not the
+/// process working directory, and directories/non-executables are rejected.
+pub fn known_command(prog: &str, cwd: &str, path_bins: &BTreeSet<String>) -> bool {
     if prog.contains('/') {
-        return Path::new(prog).exists();
+        let path = Path::new(prog);
+        let full = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            Path::new(cwd).join(path)
+        };
+        return is_executable(&full);
     }
     SHELL_BUILTINS.contains(&prog) || path_bins.contains(prog)
 }
 
-/// Collect executable basenames from $PATH (one scandir per dir, no recursion).
-pub fn path_bins() -> HashSet<String> {
-    let mut out = HashSet::new();
+fn is_executable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::metadata(path)
+            .map(|m| m.is_file())
+            .unwrap_or(false)
+    }
+}
+
+/// Collect executable basenames from `$PATH` (one scandir per dir, no
+/// recursion). Sorted and capped so candidate order is deterministic and a
+/// hostile `PATH` cannot make a suggestion unbounded.
+pub fn path_bins() -> BTreeSet<String> {
     let path = std::env::var_os("PATH").unwrap_or_default();
-    for dir in std::env::split_paths(&path) {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+    path_bins_from(&path)
+}
+
+/// Testable PATH scanner; production calls `path_bins`.
+pub fn path_bins_from(path: &std::ffi::OsStr) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for dir in std::env::split_paths(path) {
+        // An empty component means the cwd; never suggest random cwd files.
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for ent in rd.flatten() {
-            let p = ent.path();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let Ok(md) = ent.metadata() else { continue };
-                if !md.is_file() || md.permissions().mode() & 0o111 == 0 {
-                    continue;
-                }
+            let Some(name) = ent.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if name.is_empty() || out.contains(&name) {
+                continue;
             }
-            if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
-                out.insert(name.to_string());
+            if is_executable(&ent.path()) {
+                out.insert(name);
+            }
+            if out.len() >= MAX_PATH_BINS {
+                return out;
             }
         }
     }
@@ -161,10 +247,45 @@ pub fn path_bins() -> HashSet<String> {
 }
 
 const GIT_SUBCOMMANDS: &[&str] = &[
-    "add", "bisect", "branch", "checkout", "clone", "commit", "diff", "fetch", "grep", "init",
-    "log", "merge", "mv", "pull", "push", "rebase", "reset", "restore", "rm", "show", "stash",
-    "status", "switch", "tag", "worktree", "config", "remote", "reflog", "clean", "cherry-pick",
-    "describe", "apply", "am", "blame", "shortlog", "ls-files", "rev-parse", "submodule", "gc",
+    "add",
+    "bisect",
+    "branch",
+    "checkout",
+    "clone",
+    "commit",
+    "diff",
+    "fetch",
+    "grep",
+    "init",
+    "log",
+    "merge",
+    "mv",
+    "pull",
+    "push",
+    "rebase",
+    "reset",
+    "restore",
+    "rm",
+    "show",
+    "stash",
+    "status",
+    "switch",
+    "tag",
+    "worktree",
+    "config",
+    "remote",
+    "reflog",
+    "clean",
+    "cherry-pick",
+    "describe",
+    "apply",
+    "am",
+    "blame",
+    "shortlog",
+    "ls-files",
+    "rev-parse",
+    "submodule",
+    "gc",
 ];
 
 /// Branches in cwd's repo (empty outside a repo — fails fast, no output parsed on error).
@@ -334,13 +455,77 @@ fn render_swapped(tokens: &[ShellToken]) -> String {
     parts.join(" ")
 }
 
+/// Options that consume a separate value token. Knowing these prevents a
+/// value (which may itself start with `-`) from being diagnosed as a flag or
+/// treated as a path operand.
 fn option_takes_value(cmd: &str, flag: &str) -> bool {
     match cmd {
         "ls" => matches!(
             flag,
-            "-I" | "-w" | "-T" | "--ignore" | "--width" | "--tabsize"
+            "-I" | "-w"
+                | "-T"
+                | "--ignore"
+                | "--width"
+                | "--tabsize"
+                | "--block-size"
+                | "--format"
+                | "--time-style"
+                | "--quoting-style"
+                | "--indicator-style"
+                | "--hide"
+                | "--sort"
         ),
         "touch" => matches!(flag, "-r" | "-d" | "-t" | "--reference" | "--date"),
+        "mkdir" => matches!(flag, "-m" | "--mode" | "-Z" | "--context"),
+        "cp" | "mv" => matches!(flag, "-S" | "--suffix" | "-t" | "--target-directory"),
+        "grep" => matches!(
+            flag,
+            "-e" | "-f"
+                | "-m"
+                | "-A"
+                | "-B"
+                | "-C"
+                | "-d"
+                | "-D"
+                | "--regexp"
+                | "--file"
+                | "--max-count"
+                | "--after-context"
+                | "--before-context"
+                | "--context"
+                | "--directories"
+                | "--devices"
+                | "--include"
+                | "--exclude"
+                | "--exclude-dir"
+                | "--label"
+                | "--binary-files"
+        ),
+        "sed" => matches!(
+            flag,
+            "-e" | "-f" | "-l" | "--expression" | "--file" | "--line-length"
+        ),
+        "awk" => matches!(flag, "-v" | "-F" | "-f"),
+        "sort" => matches!(
+            flag,
+            "-k" | "-t"
+                | "-o"
+                | "-S"
+                | "-T"
+                | "--key"
+                | "--field-separator"
+                | "--output"
+                | "--buffer-size"
+                | "--temporary-directory"
+                | "--parallel"
+                | "--batch-size"
+                | "--files0-from"
+        ),
+        "head" | "tail" => matches!(flag, "-n" | "-c" | "--lines" | "--bytes"),
+        "cut" => matches!(
+            flag,
+            "-b" | "-c" | "-d" | "-f" | "--bytes" | "--characters" | "--delimiter" | "--fields"
+        ),
         _ => false,
     }
 }
@@ -367,17 +552,7 @@ fn path_operands(toks: &[&str]) -> Vec<usize> {
                 continue;
             }
             if t.starts_with('-') && t.len() > 1 {
-                let takes_value = match cmd {
-                    "touch" => {
-                        matches!(t, "-r" | "-d" | "-t" | "--reference" | "--date")
-                    }
-                    "mkdir" => matches!(t, "-m" | "--mode" | "-Z" | "--context"),
-                    "cp" | "mv" => {
-                        matches!(t, "-S" | "--suffix" | "-t" | "--target-directory")
-                    }
-                    _ => false,
-                };
-                i += if takes_value { 2 } else { 1 };
+                i += if option_takes_value(cmd, t) { 2 } else { 1 };
                 continue;
             }
         }
@@ -385,6 +560,46 @@ fn path_operands(toks: &[&str]) -> Vec<usize> {
         i += 1;
     }
     out
+}
+
+/// Destination of `cp`/`mv`: `(token index, embedded value, is_explicit_dir)`.
+/// Covers `-t DIR`, `--target-directory DIR`, `--target-directory=DIR`, and
+/// `-tDIR`. Without an explicit target directory the last operand is the
+/// destination.
+fn destination_operand<'a>(toks: &[&'a str]) -> Option<(usize, Option<&'a str>, bool)> {
+    let cmd = toks.first().copied().unwrap_or("");
+    let mut i = 1;
+    let mut after_dd = false;
+    while i < toks.len() {
+        let t = toks[i];
+        if !after_dd {
+            if t == "--" {
+                after_dd = true;
+                i += 1;
+                continue;
+            }
+            if t == "-t" || t == "--target-directory" {
+                return toks.get(i + 1).map(|_| (i + 1, None, true));
+            }
+            if let Some(value) = t.strip_prefix("--target-directory=") {
+                return Some((i, Some(value), true));
+            }
+            if let Some(value) = t.strip_prefix("-t").filter(|v| !v.is_empty()) {
+                return Some((i, Some(value), true));
+            }
+            // A value for an earlier option is not a target option
+            // (`cp -S -t file`: `-t` is the suffix).
+            if option_takes_value(cmd, t) {
+                i += 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    path_operands(toks)
+        .last()
+        .copied()
+        .map(|idx| (idx, None, false))
 }
 
 /// Index of the first path operand for the path-oriented commands we repair.
@@ -505,15 +720,33 @@ fn is_destructive_candidate(cmd: &str) -> bool {
     matches!(prog, "rm" | "rmdir" | "shred" | "unlink" | "dd") || prog.starts_with("mkfs")
 }
 
+/// Resolve `path` against `cwd`, expanding `~` and `~/…` against `home`.
+/// Other `$…` forms are deliberately not expanded; the lexer rejects unquoted
+/// substitutions, and a quoted `$HOME` is literal shell text.
+fn resolve_path(cwd: &str, home: Option<&Path>, path: &str) -> Option<PathBuf> {
+    if path == "~" {
+        return home.map(Path::to_path_buf);
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        return home.map(|h| h.join(rest));
+    }
+    let p = Path::new(path);
+    Some(if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        Path::new(cwd).join(p)
+    })
+}
+
 /// Resolve `path` against `cwd`; if a component is missing, walk up to find the
 /// deepest existing ancestor and return the missing components from that
 /// ancestor down to the leaf, in path order.
-fn missing_components(cwd: &str, path: &str) -> Option<(PathBuf, Vec<String>)> {
-    let full = if Path::new(path).is_absolute() {
-        PathBuf::from(path)
-    } else {
-        Path::new(cwd).join(path)
-    };
+fn missing_components(
+    cwd: &str,
+    home: Option<&Path>,
+    path: &str,
+) -> Option<(PathBuf, Vec<String>)> {
+    let full = resolve_path(cwd, home, path)?;
     if full.exists() {
         return None;
     }
@@ -532,16 +765,38 @@ fn missing_components(cwd: &str, path: &str) -> Option<(PathBuf, Vec<String>)> {
     Some((cur, missing))
 }
 
+/// Path-kind guard for repairs: `cd` needs a directory, `cat` a file, while
+/// `ls`/`touch` accept any existing path.
+fn path_fits_command(cmd: &str, path: &Path) -> bool {
+    match cmd {
+        "cd" => path.is_dir(),
+        "cat" => path.is_file(),
+        _ => path.exists(),
+    }
+}
+
+/// Index of the first token that plausibly is an option. Stops at `--`, skips
+/// negative numbers, and skips separate values of options known to take one
+/// (so `grep -e -foo file` does not diagnose `-foo`).
 fn flag_index(toks: &[&str]) -> Option<usize> {
-    for (i, t) in toks.iter().enumerate().skip(1) {
-        if *t == "--" {
+    let cmd = toks.first().copied().unwrap_or("");
+    let mut i = 1;
+    while i < toks.len() {
+        let t = toks[i];
+        if t == "--" {
             break;
         }
-        if *t == "-" || !t.starts_with('-') {
+        if t == "-" || !t.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        if option_takes_value(cmd, t) {
+            i += 2;
             continue;
         }
         let body = &t[1..];
         if body.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            i += 1;
             continue; // negative number or numeric sort key
         }
         if body
@@ -551,8 +806,26 @@ fn flag_index(toks: &[&str]) -> Option<usize> {
         {
             return Some(i);
         }
+        i += 1;
     }
     None
+}
+
+/// True when a token could be a command name that needs a `PATH` lookup.
+/// Builtins, shell syntax, and explicit paths never do.
+fn needs_path_lookup(word: &str) -> bool {
+    !word.contains('/') && !SHELL_BUILTINS.contains(&word) && !is_shell_syntax(word)
+}
+
+/// True when `flag` appears as a short option, including clusters like `-pv`.
+fn has_short_flag(toks: &[&str], short: char) -> bool {
+    toks.iter()
+        .take_while(|t| **t != "--")
+        .any(|t| t.starts_with('-') && !t.starts_with("--") && t[1..].chars().any(|c| c == short))
+}
+
+fn is_displayable(s: &str) -> bool {
+    !s.chars().any(char::is_control)
 }
 
 /// Suggest a fix for a failed command when the shell status is unknown.
@@ -572,6 +845,24 @@ pub fn suggest_with_exit(
     history: &[String],
     exit_code: Option<i64>,
 ) -> Vec<String> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    // An unknown EUID is treated as root: never suggest sudo unless we can
+    // prove the caller is unprivileged.
+    let euid = effective_uid().unwrap_or(0);
+    suggest_with_context(cmd, cwd, history, exit_code, None, home.as_deref(), euid)
+}
+
+/// Inner entry point with injectable command pool, home, and EUID so rules can
+/// be tested without mutating process-wide environment.
+fn suggest_with_context(
+    cmd: &str,
+    cwd: &str,
+    history: &[String],
+    exit_code: Option<i64>,
+    bins: Option<&BTreeSet<String>>,
+    home: Option<&Path>,
+    euid: u32,
+) -> Vec<String> {
     let mut out: Vec<String> = vec![];
     if exit_code == Some(0) {
         return out;
@@ -583,7 +874,18 @@ pub fn suggest_with_exit(
     if toks.is_empty() {
         return out;
     }
-    let bins = path_bins();
+    // At most one PATH scan per call, and only when the first token actually
+    // needs PATH/builtin knowledge.
+    let empty_bins = BTreeSet::new();
+    let owned_bins: BTreeSet<String>;
+    let bins: &BTreeSet<String> = match bins {
+        Some(bins) => bins,
+        None if needs_path_lookup(toks[0]) => {
+            owned_bins = path_bins();
+            &owned_bins
+        }
+        None => &empty_bins,
+    };
     let unknown_command = exit_code.is_none() || exit_code == Some(127);
     let git_failure = exit_code.is_none() || exit_code == Some(1);
     let flag_failure = exit_code.is_none() || matches!(exit_code, Some(1) | Some(2));
@@ -595,15 +897,15 @@ pub fn suggest_with_exit(
         && toks.len() >= 2
         && toks[1] == "git"
         && GIT_SUBCOMMANDS.contains(&toks[0])
-        && !known_command(toks[0], &bins)
-        && known_command(toks[1], &bins)
+        && !known_command(toks[0], cwd, bins)
+        && known_command(toks[1], cwd, bins)
     {
         out.push(render_swapped(&tokens));
     }
 
     // Rule 1: unknown command name — typo over PATH + builtins + history verbs.
     if unknown_command
-        && !known_command(toks[0], &bins)
+        && !known_command(toks[0], cwd, bins)
         && !is_shell_syntax(toks[0])
         && out.is_empty()
     {
@@ -649,7 +951,7 @@ pub fn suggest_with_exit(
     // Rule 3: cd case / path typo at the first real path operand.
     if matches!(toks[0], "cd" | "cat" | "ls" | "touch")
         && let Some(path_idx) = path_operand_index(&toks)
-        && let Some((parent, missing)) = missing_components(cwd, toks[path_idx])
+        && let Some((parent, missing)) = missing_components(cwd, home, toks[path_idx])
         && let Ok(rd) = std::fs::read_dir(&parent)
     {
         let mut siblings: Vec<String> = rd
@@ -657,6 +959,9 @@ pub fn suggest_with_exit(
             .filter_map(|e| e.file_name().into_string().ok())
             .collect();
         siblings.sort();
+        // Filter by the command's expected path kind before ranking, so a
+        // regular file named like a directory cannot shadow the real one.
+        siblings.retain(|s| path_fits_command(toks[0], &parent.join(s)));
         let first = &missing[0];
         // Case-only fix first (the `cd downloads` class), then fuzzy.
         let mut repaired: Vec<PathBuf> = siblings
@@ -676,11 +981,11 @@ pub fn suggest_with_exit(
                 .iter()
                 .skip(1)
                 .fold(fixed_root, |path, component| path.join(component));
-            if !fixed_path.exists() || (toks[0] == "cd" && !fixed_path.is_dir()) {
+            if !path_fits_command(toks[0], &fixed_path) {
                 continue;
             }
-            let display = pretty_path(cwd, &fixed_path);
-            if display.chars().any(|c| c.is_control()) {
+            let display = pretty_path(cwd, home, &fixed_path);
+            if !is_displayable(&display) {
                 continue;
             }
             out.push(render_with(&tokens, &[(path_idx, path_quote(&display))]));
@@ -688,33 +993,68 @@ pub fn suggest_with_exit(
         }
     }
 
-    // Rule 4: missing `mkdir -p` — touch/mkdir/cp/mv with missing intermediate dir.
+    // Rule 4: missing `mkdir -p` — touch/mkdir/cp/mv with a missing target
+    // directory. The candidate must create what the original command needs,
+    // not run the original a second time.
     if matches!(toks[0], "touch" | "mkdir" | "cp" | "mv") && toks.len() >= 2 {
-        // Last non-option operand is the path that needs its parent to exist
-        // (for cp/mv target likewise). Flags are never candidates.
-        let operands = path_operands(&toks);
-        if let Some(&target_idx) = operands.last() {
-            let target = toks[target_idx];
-            let full = if Path::new(target).is_absolute() {
-                PathBuf::from(target)
-            } else {
-                Path::new(cwd).join(target)
-            };
-            let parent = if toks[0] == "mkdir" {
-                full.clone()
-            } else {
-                full.parent()
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or(full.clone())
-            };
-            if !parent.exists() {
-                let display = pretty_path(cwd, &parent);
-                if !display.chars().any(|c| c.is_control()) {
-                    out.push(format!(
-                        "mkdir -p {} && {}",
-                        path_quote(&display),
-                        render_raw(&tokens)
-                    ));
+        match toks[0] {
+            "mkdir" => {
+                let has_parents = has_short_flag(&toks, 'p') || toks.contains(&"--parents");
+                if !has_parents
+                    && path_operands(&toks)
+                        .iter()
+                        .any(|&i| resolve_path(cwd, home, toks[i]).is_some_and(|p| !p.exists()))
+                {
+                    out.push(format!("mkdir -p {}", render_raw(&tokens[1..])));
+                }
+            }
+            "touch" => {
+                if let Some(&target_idx) = path_operands(&toks).last()
+                    && let Some(full) = resolve_path(cwd, home, toks[target_idx])
+                    && let Some(parent) = full.parent()
+                    && !parent.exists()
+                {
+                    let display = pretty_path(cwd, home, parent);
+                    if is_displayable(&display) {
+                        out.push(format!(
+                            "mkdir -p {} && {}",
+                            path_quote(&display),
+                            render_raw(&tokens)
+                        ));
+                    }
+                }
+            }
+            _ => {
+                // cp/mv: `-t` wins; otherwise the last operand is the target.
+                let operands = path_operands(&toks);
+                if let Some((dest_idx, embedded, explicit)) = destination_operand(&toks) {
+                    let target = embedded.unwrap_or(toks[dest_idx]).trim_end_matches('/');
+                    if !target.is_empty()
+                        && let Some(full) = resolve_path(cwd, home, target)
+                    {
+                        let source_count = if explicit {
+                            operands.len()
+                        } else {
+                            operands.len().saturating_sub(1)
+                        };
+                        let target_is_dir =
+                            explicit || source_count > 1 || toks[dest_idx].ends_with('/');
+                        let dir = if target_is_dir {
+                            full
+                        } else {
+                            full.parent().map(Path::to_path_buf).unwrap_or(full)
+                        };
+                        if !dir.exists() {
+                            let display = pretty_path(cwd, home, &dir);
+                            if is_displayable(&display) {
+                                out.push(format!(
+                                    "mkdir -p {} && {}",
+                                    path_quote(&display),
+                                    render_raw(&tokens)
+                                ));
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -754,16 +1094,27 @@ pub fn suggest_with_exit(
                 };
                 let ht: Vec<&str> = htoks.iter().map(|t| t.value.as_str()).collect();
                 if ht.len() > prefix.len() && ht[..prefix.len()] == prefix[..] {
-                    for t in &ht[prefix.len()..] {
-                        if *t == "--" {
+                    let mut j = prefix.len();
+                    while j < ht.len() {
+                        let t = ht[j];
+                        if t == "--" {
                             break;
                         }
-                        if t.starts_with('-') {
-                            let name = t.split('=').next().unwrap_or(t);
-                            if name != bad_name && !flag_pool.iter().any(|p| p == name) {
-                                flag_pool.push(name.to_string());
+                        if let Some(body) = t.strip_prefix('-') {
+                            // A value belonging to an earlier option is not a
+                            // flag (`grep -e -foo`).
+                            if option_takes_value(toks[0], t) {
+                                j += 2;
+                                continue;
+                            }
+                            if !body.chars().all(|c| c.is_ascii_digit() || c == '.') {
+                                let name = t.split('=').next().unwrap_or(t);
+                                if name != bad_name && !flag_pool.iter().any(|p| p == name) {
+                                    flag_pool.push(name.to_string());
+                                }
                             }
                         }
+                        j += 1;
                     }
                 }
             }
@@ -781,19 +1132,11 @@ pub fn suggest_with_exit(
         }
     }
 
-    // Rule 6 (heuristic, ranked last): missing sudo for root-needing prefixes on failure.
-    // No stderr available, so this only fires for a narrow allowlist and is always last.
-    const SUDO_PREFIXES: &[&str] = &[
-        "apt install",
-        "apt-get install",
-        "systemctl",
-        "mkdir /etc/",
-        "mkdir /opt/",
-        "tee /etc/",
-        "tee /sys/",
-    ];
-    if sudo_failure && SUDO_PREFIXES.iter().any(|p| cmd.starts_with(p)) {
-        out.push(format!("sudo {}", render_raw(&tokens)));
+    // Rule 6 (heuristic, ranked last): missing sudo for root-needing commands.
+    // Token-aware, checks EUID and that a privilege tool exists. A wrong sudo
+    // suggestion is worse than none, so every uncertainty suppresses it.
+    if sudo_failure && let Some(candidate) = sudo_candidate(&tokens, &toks, cwd, bins, euid) {
+        out.push(candidate);
     }
 
     // Dedupe, cap 3. Destructive candidates are suppressed, not merely ranked
@@ -806,18 +1149,90 @@ pub fn suggest_with_exit(
         .collect()
 }
 
-fn pretty_path(cwd: &str, p: &Path) -> String {
-    match p.strip_prefix(cwd) {
-        Ok(rel) if !rel.as_os_str().is_empty() => rel.to_string_lossy().into_owned(),
-        _ => {
-            if let Some(home) = std::env::var_os("HOME") {
-                if let Ok(rel) = p.strip_prefix(home) {
-                    return format!("~/{}", rel.to_string_lossy());
-                }
-            }
-            p.to_string_lossy().into_owned()
-        }
+/// Linux effective UID. `None` means unknown, which callers treat as root
+/// (i.e. no sudo suggestion).
+fn effective_uid() -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        let uid_line = status.lines().find(|line| line.starts_with("Uid:"))?;
+        uid_line.split_whitespace().nth(2)?.parse().ok()
     }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// True when `path` resolves inside `root`. Component-based, so `/etcetera`
+/// is not treated as `/etc`.
+fn path_under(cwd: &str, path: &str, root: &str) -> bool {
+    resolve_path(cwd, None, path).is_some_and(|p| p.starts_with(root))
+}
+
+/// Paths whose creation normally requires root.
+fn is_protected_path(cwd: &str, path: &str) -> bool {
+    ["/etc", "/opt", "/usr", "/var"]
+        .iter()
+        .any(|root| path_under(cwd, path, root))
+}
+
+/// Narrow, token-aware root-need allowlist. Package installs and systemd
+/// control need root; `mkdir`/`tee` do only when their operand is a missing
+/// system path (`tee` may target an existing protected file on EACCES).
+fn command_needs_root(toks: &[&str], cwd: &str) -> bool {
+    match toks[0] {
+        "systemctl" => true,
+        "apt" | "apt-get" => toks.get(1) == Some(&"install"),
+        "mkdir" => path_operands(toks).iter().any(|&i| {
+            is_protected_path(cwd, toks[i])
+                && resolve_path(cwd, None, toks[i]).is_some_and(|p| !p.exists())
+        }),
+        "tee" => path_operands(toks)
+            .iter()
+            .any(|&i| is_protected_path(cwd, toks[i]) || path_under(cwd, toks[i], "/sys")),
+        _ => false,
+    }
+}
+
+fn sudo_candidate(
+    tokens: &[ShellToken],
+    toks: &[&str],
+    cwd: &str,
+    bins: &BTreeSet<String>,
+    euid: u32,
+) -> Option<String> {
+    if euid == 0 || !known_command(toks[0], cwd, bins) || !command_needs_root(toks, cwd) {
+        return None;
+    }
+    let tool = if bins.contains("sudo") {
+        "sudo"
+    } else if bins.contains("doas") {
+        "doas"
+    } else {
+        return None;
+    };
+    let body = if toks[0] == "mkdir" && !has_short_flag(toks, 'p') && !toks.contains(&"--parents") {
+        format!("mkdir -p {}", render_raw(&tokens[1..]))
+    } else {
+        render_raw(tokens)
+    };
+    Some(format!("{tool} {body}"))
+}
+
+fn pretty_path(cwd: &str, home: Option<&Path>, p: &Path) -> String {
+    if let Ok(rel) = p.strip_prefix(cwd)
+        && !rel.as_os_str().is_empty()
+    {
+        return rel.to_string_lossy().into_owned();
+    }
+    if let Some(home) = home
+        && let Ok(rel) = p.strip_prefix(home)
+        && !rel.as_os_str().is_empty()
+    {
+        return format!("~/{}", rel.to_string_lossy());
+    }
+    p.to_string_lossy().into_owned()
 }
 
 #[cfg(test)]
@@ -894,10 +1309,16 @@ mod tests {
 
         let out = suggest("cd downloads/sub", &cwd, &[]);
         assert!(out.iter().any(|s| s == "cd Downloads/sub"), "got: {out:?}");
-        assert!(!out.iter().any(|s| s == "cd sun"), "truncated path: {out:?}");
+        assert!(
+            !out.iter().any(|s| s == "cd sun"),
+            "truncated path: {out:?}"
+        );
 
         let out = suggest("cd downloads/missing", &cwd, &[]);
-        assert!(!out.iter().any(|s| s == "cd Downloads"), "truncated path: {out:?}");
+        assert!(
+            !out.iter().any(|s| s == "cd Downloads"),
+            "truncated path: {out:?}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -915,7 +1336,10 @@ mod tests {
         let history = vec!["echo --colr".to_string(), "echo --color".to_string()];
         let out = suggest("echo --colr", "/tmp", &history);
         assert!(out.iter().any(|s| s == "echo --color"), "got: {out:?}");
-        assert!(!out.iter().any(|s| s == "echo --colr"), "self suggestion: {out:?}");
+        assert!(
+            !out.iter().any(|s| s == "echo --colr"),
+            "self suggestion: {out:?}"
+        );
     }
 
     #[test]
@@ -930,7 +1354,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let cwd = dir.to_string_lossy().into_owned();
         let out = suggest("touch a/b/c.txt", &cwd, &[]);
-        assert!(out.iter().any(|s| s.starts_with("mkdir -p") && s.contains("touch a/b/c.txt")), "got: {out:?}");
+        assert!(
+            out.iter()
+                .any(|s| s.starts_with("mkdir -p") && s.contains("touch a/b/c.txt")),
+            "got: {out:?}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1116,5 +1544,307 @@ mod tests {
         assert!(!out.iter().any(|s| s.contains("rm")), "got: {out:?}");
         let out2 = suggest("ls", "/tmp", &[]);
         assert!(out2.is_empty(), "got: {out2:?}");
+    }
+
+    // ---- Medium-finding regressions -------------------------------------
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("gl-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn fake_bins(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn with_context(
+        cmd: &str,
+        cwd: &str,
+        bins: &BTreeSet<String>,
+        home: Option<&Path>,
+        euid: u32,
+    ) -> Vec<String> {
+        suggest_with_context(cmd, cwd, &[], None, Some(bins), home, euid)
+    }
+
+    fn osa_reference(a: &str, b: &str) -> usize {
+        let a: Vec<char> = a.chars().collect();
+        let b: Vec<char> = b.chars().collect();
+        let mut d = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+        for (i, row) in d.iter_mut().enumerate() {
+            row[0] = i;
+        }
+        for (j, cell) in d[0].iter_mut().enumerate() {
+            *cell = j;
+        }
+        for i in 1..=a.len() {
+            for j in 1..=b.len() {
+                let cost = usize::from(a[i - 1] != b[j - 1]);
+                d[i][j] = (d[i - 1][j] + 1)
+                    .min(d[i][j - 1] + 1)
+                    .min(d[i - 1][j - 1] + cost);
+                if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                    d[i][j] = d[i][j].min(d[i - 2][j - 2] + 1);
+                }
+            }
+        }
+        d[a.len()][b.len()]
+    }
+
+    #[test]
+    fn osa_rolling_rows_match_reference() {
+        for (a, b) in [
+            ("", ""),
+            ("a", ""),
+            ("", "a"),
+            ("gti", "git"),
+            ("chekout", "checkout"),
+            ("ab", "ba"),
+            ("abc", "cba"),
+            ("aab", "aba"),
+            ("é", "e"),
+            ("downloads", "download"),
+        ] {
+            assert_eq!(osa(a, b), osa_reference(a, b), "{a:?} vs {b:?}");
+        }
+    }
+
+    #[test]
+    fn threshold_counts_characters_not_bytes() {
+        // Six chars: threshold is 2. As bytes (12) the old formula allowed 4.
+        assert!(!within_threshold("éééééé", 3));
+        assert!(within_threshold("éééééé", 2));
+    }
+
+    #[test]
+    fn best_ties_are_deterministic_by_name() {
+        let pref = HashSet::new();
+        assert_eq!(best("fooo", ["foob", "fooa"], &pref), Some("fooa"));
+        assert_eq!(best("fooo", ["fooa", "foob"], &pref), Some("fooa"));
+        assert_eq!(best("fooo", ["foot", "foob", "fooa"], &pref), Some("fooa"));
+    }
+
+    #[test]
+    fn best_skips_length_mismatches_and_overlong_words() {
+        let pref = HashSet::new();
+        assert_eq!(best("ls", ["lsaaaaaaaa"], &pref), None);
+        let long = "a".repeat(MAX_WORD_LEN + 1);
+        assert_eq!(best(&long, ["aa"], &pref), None);
+        assert_eq!(best("aa", [long.as_str()], &pref), None);
+    }
+
+    #[test]
+    fn path_bins_from_is_sorted_and_executable_only() {
+        let dir = tmp_dir("bins");
+        let exec = |name: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, "#!/bin/sh\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        };
+        exec("foob");
+        exec("fooa");
+        std::fs::write(dir.join("plain.txt"), "x").unwrap();
+        std::fs::create_dir_all(dir.join("adir")).unwrap();
+
+        let bins = path_bins_from(dir.as_os_str());
+        let names: Vec<&str> = bins.iter().map(String::as_str).collect();
+        assert_eq!(names, ["fooa", "foob"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn known_command_resolves_against_cwd_and_requires_executable_file() {
+        let dir = tmp_dir("known");
+        let tool = dir.join("tool");
+        std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+        let plain = dir.join("plain");
+        std::fs::write(&plain, "x").unwrap();
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let cwd = dir.to_string_lossy().into_owned();
+        let empty = BTreeSet::new();
+        assert!(known_command("./tool", &cwd, &empty));
+        assert!(!known_command("./sub", &cwd, &empty), "directory accepted");
+        assert!(
+            !known_command("./plain", &cwd, &empty),
+            "non-executable accepted"
+        );
+        assert!(!known_command("./missing", &cwd, &empty));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mkdir_repair_does_not_repeat_the_original() {
+        let dir = tmp_dir("mkdir4");
+        let cwd = dir.to_string_lossy().into_owned();
+        let out = suggest("mkdir a/b", &cwd, &[]);
+        assert_eq!(out, vec!["mkdir -p a/b"], "got: {out:?}");
+        assert!(!out.iter().any(|s| s.contains("&&")), "duplicate: {out:?}");
+
+        let out = suggest("mkdir -p a/b", &cwd, &[]);
+        assert!(out.is_empty(), "already creates parents: {out:?}");
+
+        let out = suggest("mkdir -m 700 a/b", &cwd, &[]);
+        assert_eq!(out, vec!["mkdir -p -m 700 a/b"], "got: {out:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cp_and_mv_target_directory_semantics() {
+        let dir = tmp_dir("cptarget");
+        std::fs::write(dir.join("file"), "x").unwrap();
+        let cwd = dir.to_string_lossy().into_owned();
+        for (cmd, expected) in [
+            ("cp file newdir/", "mkdir -p newdir && cp file newdir/"),
+            ("cp -t newdir file", "mkdir -p newdir && cp -t newdir file"),
+            ("cp -tnewdir file", "mkdir -p newdir && cp -tnewdir file"),
+            (
+                "cp --target-directory=newdir file",
+                "mkdir -p newdir && cp --target-directory=newdir file",
+            ),
+            ("cp a b newdir", "mkdir -p newdir && cp a b newdir"),
+            (
+                "mv file newdir/file2",
+                "mkdir -p newdir && mv file newdir/file2",
+            ),
+        ] {
+            let out = suggest(cmd, &cwd, &[]);
+            assert!(out.iter().any(|s| s == expected), "{cmd}: {out:?}");
+        }
+        // A plain rename needs no target directory.
+        let out = suggest("cp file other", &cwd, &[]);
+        assert!(out.is_empty(), "got: {out:?}");
+        // `-t` here is the value of `-S`, not a target-directory option.
+        let out = suggest("cp -S -t file", &cwd, &[]);
+        assert!(out.is_empty(), "option value treated as target: {out:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cd_requires_a_directory_and_expands_tilde() {
+        let dir = tmp_dir("cdtype");
+        std::fs::write(dir.join("Downloads"), "not a dir").unwrap();
+        let cwd = dir.to_string_lossy().into_owned();
+        let out = suggest("cd downloads", &cwd, &[]);
+        assert!(out.is_empty(), "file accepted as cd target: {out:?}");
+        std::fs::remove_dir_all(&dir).ok();
+
+        let home = tmp_dir("home");
+        std::fs::create_dir_all(home.join("Downloads")).unwrap();
+        let work = tmp_dir("work");
+        let cwd = work.to_string_lossy().into_owned();
+        let bins = BTreeSet::new();
+        let out = with_context("cd ~/downloads", &cwd, &bins, Some(home.as_path()), 1000);
+        assert!(out.iter().any(|s| s == "cd ~/Downloads"), "got: {out:?}");
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&work).ok();
+    }
+
+    #[test]
+    fn sudo_rule_is_token_aware_and_guarded() {
+        let dir = tmp_dir("sudo");
+        let cwd = dir.to_string_lossy().into_owned();
+        let pool = fake_bins(&["sudo", "systemctl", "mkdir", "tee", "apt", "apt-get"]);
+
+        let out = with_context("systemctl restart nginx", &cwd, &pool, None, 1000);
+        assert!(
+            out.iter().any(|s| s == "sudo systemctl restart nginx"),
+            "got: {out:?}"
+        );
+
+        // Prefix collision: `systemctlfoo` is not `systemctl`.
+        let out = with_context("systemctlfoo restart nginx", &cwd, &pool, None, 1000);
+        assert!(
+            !out.iter().any(|s| s.starts_with("sudo")),
+            "prefix matched: {out:?}"
+        );
+
+        // `-p` form is recognized and never duplicated.
+        let out = with_context("mkdir -p /etc/ghostline-review", &cwd, &pool, None, 1000);
+        assert!(
+            out.iter()
+                .any(|s| s == "sudo mkdir -p /etc/ghostline-review"),
+            "got: {out:?}"
+        );
+        assert!(!out.iter().any(|s| s.contains("&&")), "duplicate: {out:?}");
+
+        // Root gets no sudo suggestion.
+        let out = with_context("systemctl restart nginx", &cwd, &pool, None, 0);
+        assert!(!out.iter().any(|s| s.starts_with("sudo")), "got: {out:?}");
+
+        // No privilege tool installed.
+        let no_sudo = fake_bins(&["systemctl", "mkdir", "tee"]);
+        let out = with_context("systemctl restart nginx", &cwd, &no_sudo, None, 1000);
+        assert!(!out.iter().any(|s| s.starts_with("sudo")), "got: {out:?}");
+
+        // exit 127 means the command is missing, not that it needs root.
+        let out = suggest_with_context(
+            "systemctl restart nginx",
+            &cwd,
+            &[],
+            Some(127),
+            Some(&pool),
+            None,
+            1000,
+        );
+        assert!(!out.iter().any(|s| s.starts_with("sudo")), "got: {out:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn flag_index_skips_option_values_but_finds_short_flags() {
+        assert_eq!(flag_index(&["grep", "-e", "-fo", "file"]), None);
+        assert_eq!(flag_index(&["cat", "-N", "file"]), Some(1));
+        assert_eq!(flag_index(&["ls", "--color=auto", "file"]), Some(1));
+        let history = vec!["cat -n file".to_string()];
+        let out = suggest("cat -N file", "/tmp", &history);
+        assert!(out.iter().any(|s| s == "cat -n file"), "got: {out:?}");
+    }
+
+    #[test]
+    fn history_option_values_do_not_become_flag_candidates() {
+        let history = vec!["grep -f -colr file".to_string()];
+        let out = suggest("grep --colr file", "/tmp", &history);
+        assert!(
+            !out.iter().any(|s| s.contains("-colr")),
+            "option value became a flag: {out:?}"
+        );
+        assert!(out.is_empty(), "got: {out:?}");
+    }
+
+    #[test]
+    fn path_kind_is_filtered_before_ranking() {
+        let dir = tmp_dir("pathkind");
+        std::fs::write(dir.join("Downloads"), "file").unwrap();
+        std::fs::create_dir_all(dir.join("downloads")).unwrap();
+        let cwd = dir.to_string_lossy().into_owned();
+
+        // Case-fold exact matches a file and a directory; only the directory
+        // can be a `cd` target.
+        let out = suggest("cd DOWNlOADS", &cwd, &[]);
+        assert!(out.iter().any(|s| s == "cd downloads"), "got: {out:?}");
+
+        // `ls` and `cat` keep their own type rules.
+        let out = suggest("ls downlods", &cwd, &[]);
+        assert!(out.iter().any(|s| s == "ls Downloads"), "got: {out:?}");
+        let out = suggest("cat downlods", &cwd, &[]);
+        assert!(out.iter().any(|s| s == "cat Downloads"), "got: {out:?}");
+        std::fs::create_dir_all(dir.join("reports")).unwrap();
+        let out = suggest("cat repotrs", &cwd, &[]);
+        assert!(out.is_empty(), "directory accepted for cat: {out:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -157,8 +157,9 @@ pub fn git_branches(cwd: &str) -> Vec<String> {
 }
 
 /// Resolve `path` against `cwd`; if a component is missing, walk up to find the
-/// deepest existing ancestor and the first missing component.
-fn missing_component(cwd: &str, path: &str) -> Option<(PathBuf, String)> {
+/// deepest existing ancestor and return the missing components from that
+/// ancestor down to the leaf, in path order.
+fn missing_components(cwd: &str, path: &str) -> Option<(PathBuf, Vec<String>)> {
     let full = if Path::new(path).is_absolute() {
         PathBuf::from(path)
     } else {
@@ -167,19 +168,19 @@ fn missing_component(cwd: &str, path: &str) -> Option<(PathBuf, String)> {
     if full.exists() {
         return None;
     }
-    let mut cur = full.clone();
+    let mut cur = full;
     let mut missing: Vec<String> = vec![];
     while !cur.exists() {
-        match cur.file_name().and_then(|s| s.to_str()) {
-            Some(name) => missing.push(name.to_string()),
-            None => return None, // hit filesystem root without finding anything existing
+        let name = cur.file_name().and_then(|s| s.to_str())?;
+        missing.push(name.to_string());
+        let parent = cur.parent()?;
+        if parent.as_os_str().is_empty() {
+            return None;
         }
-        match cur.parent() {
-            Some(p) if !p.as_os_str().is_empty() => cur = p.to_path_buf(),
-            _ => return None,
-        }
+        cur = parent.to_path_buf();
     }
-    missing.into_iter().next().map(|first| (cur, first))
+    missing.reverse();
+    Some((cur, missing))
 }
 
 /// Suggest a fix for a failed command. Filesystem-grounded only (no stderr available).
@@ -213,6 +214,10 @@ pub fn suggest(cmd: &str, cwd: &str, history: &[String]) -> Vec<String> {
             }
             pool.extend_from_slice(SHELL_BUILTINS);
             pool.extend(verbs);
+            // Never offer the failed token back as its own correction. History
+            // can legitimately contain it (e.g. the current failed command).
+            let typed_lower = toks[0].to_lowercase();
+            pool.retain(|c| c.to_lowercase() != typed_lower);
             if let Some(hit) = best(toks[0], pool, &preferred) {
                 let mut fixed = vec![hit.to_string()];
                 fixed.extend(toks[1..].iter().map(|s| s.to_string()));
@@ -248,32 +253,40 @@ pub fn suggest(cmd: &str, cwd: &str, history: &[String]) -> Vec<String> {
     // Rule 3: cd case / path typo (first missing path component).
     if (toks[0] == "cd" || toks[0] == "cat" || toks[0] == "ls" || toks[0] == "touch")
         && toks.len() >= 2
+        && let Some((parent, missing)) = missing_components(cwd, toks[1])
+        && let Ok(rd) = std::fs::read_dir(&parent)
     {
-        if let Some((parent, missing)) = missing_component(cwd, toks[1]) {
-            if let Ok(rd) = std::fs::read_dir(&parent) {
-                let siblings: Vec<String> = rd
-                    .flatten()
-                    .filter_map(|e| e.file_name().into_string().ok())
-                    .collect();
-                // Case-only fix first (the `cd downloads` class).
-                if let Some(exact) = siblings.iter().find(|s| s.to_lowercase() == missing.to_lowercase()) {
-                    let fixed_path = parent.join(exact);
-                    let display = pretty_path(cwd, &fixed_path);
-                    let mut fixed = vec![toks[0].to_string(), display];
-                    fixed.extend(toks[2..].iter().map(|s| s.to_string()));
-                    out.push(fixed.join(" "));
-                } else {
-                    let refs: Vec<&str> = siblings.iter().map(|s| s.as_str()).collect();
-                    let no_pref: HashSet<&str> = HashSet::new();
-                    if let Some(hit) = best(&missing, refs, &no_pref) {
-                        let fixed_path = parent.join(hit);
-                        let display = pretty_path(cwd, &fixed_path);
-                        let mut fixed = vec![toks[0].to_string(), display];
-                        fixed.extend(toks[2..].iter().map(|s| s.to_string()));
-                        out.push(fixed.join(" "));
-                    }
-                }
+        let siblings: Vec<String> = rd
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect();
+        let first = &missing[0];
+        // Case-only fix first (the `cd downloads` class), then fuzzy.
+        let mut repaired: Vec<PathBuf> = siblings
+            .iter()
+            .find(|s| s.to_lowercase() == first.to_lowercase())
+            .map(|exact| vec![parent.join(exact)])
+            .unwrap_or_default();
+        let refs: Vec<&str> = siblings.iter().map(|s| s.as_str()).collect();
+        let no_pref: HashSet<&str> = HashSet::new();
+        if let Some(hit) = best(first, refs, &no_pref) {
+            repaired.push(parent.join(hit));
+        }
+        for fixed_root in repaired {
+            // Keep every component after the repaired one intact: a partial
+            // path must not silently collapse to a sibling.
+            let fixed_path = missing
+                .iter()
+                .skip(1)
+                .fold(fixed_root, |path, component| path.join(component));
+            if !fixed_path.exists() {
+                continue;
             }
+            let display = pretty_path(cwd, &fixed_path);
+            let mut fixed = vec![toks[0].to_string(), display];
+            fixed.extend(toks[2..].iter().map(|s| s.to_string()));
+            out.push(fixed.join(" "));
+            break;
         }
     }
 
@@ -305,13 +318,15 @@ pub fn suggest(cmd: &str, cwd: &str, history: &[String]) -> Vec<String> {
                 let ht: Vec<&str> = h.split_whitespace().collect();
                 if ht.len() > prefix.len() && ht[..prefix.len()] == prefix[..] {
                     for t in &ht[prefix.len()..] {
-                        if t.starts_with('-') {
+                        if t.starts_with('-') && *t != *bad_flag {
                             flag_pool.push(t);
                         }
                     }
                 }
             }
-            if let Some(hit) = best(bad_flag, flag_pool, &HashSet::new()) {
+            if let Some(hit) = best(bad_flag, flag_pool, &HashSet::new())
+                && hit != *bad_flag
+            {
                 out.push(cmd.replacen(bad_flag, hit, 1));
             }
         }
@@ -405,6 +420,43 @@ mod tests {
         let out = suggest("cd Documnets", &cwd, &[]);
         assert!(out.iter().any(|s| s == "cd Documents"), "got: {out:?}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn path_typo_preserves_multi_component_suffix() {
+        let dir = std::env::temp_dir().join(format!("gl-fixsuffix-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("Documents/sub")).unwrap();
+        std::fs::create_dir_all(dir.join("Downloads/sub")).unwrap();
+        std::fs::create_dir_all(dir.join("sun")).unwrap();
+        let cwd = dir.to_string_lossy().into_owned();
+
+        let out = suggest("cd Documnets/sub", &cwd, &[]);
+        assert!(out.iter().any(|s| s == "cd Documents/sub"), "got: {out:?}");
+
+        let out = suggest("cd downloads/sub", &cwd, &[]);
+        assert!(out.iter().any(|s| s == "cd Downloads/sub"), "got: {out:?}");
+        assert!(!out.iter().any(|s| s == "cd sun"), "truncated path: {out:?}");
+
+        let out = suggest("cd downloads/missing", &cwd, &[]);
+        assert!(!out.iter().any(|s| s == "cd Downloads"), "truncated path: {out:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn failed_self_history_is_not_a_candidate() {
+        let history = vec!["cdd".to_string(), "cd".to_string()];
+        let out = suggest("cdd", "/tmp", &history);
+        assert!(out.iter().any(|s| s == "cd"), "got: {out:?}");
+        assert!(!out.iter().any(|s| s == "cdd"), "self suggestion: {out:?}");
+    }
+
+    #[test]
+    fn failed_flag_in_history_is_not_a_candidate() {
+        let history = vec!["echo --colr".to_string(), "echo --color".to_string()];
+        let out = suggest("echo --colr", "/tmp", &history);
+        assert!(out.iter().any(|s| s == "echo --color"), "got: {out:?}");
+        assert!(!out.iter().any(|s| s == "echo --colr"), "self suggestion: {out:?}");
     }
 
     #[test]

@@ -44,7 +44,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         let row: Option<(String, String, i64)> = match &conn {
             Some(conn) => {
                 let mut stmt = conn
-                    .prepare("SELECT cmd, cwd, exit_code FROM history WHERE exit_code != 0 ORDER BY started_at DESC LIMIT 1")
+                    .prepare("SELECT cmd, cwd, exit_code FROM history WHERE exit_code != 0 ORDER BY started_at DESC, id DESC LIMIT 1")
                     .map_err(|e| format!("query last failure: {e}"))?;
                 stmt.query_row([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
                     .ok()
@@ -71,13 +71,21 @@ pub fn run(args: &[String]) -> Result<(), String> {
         cwd
     };
 
-    // History context for verb/flag learning: recent commands sharing the first token.
+    // History context for verb/flag learning: recent successful, non-sensitive
+    // commands sharing the first token, excluding the command being repaired.
     let first = cmd.split_whitespace().next().unwrap_or("").to_string();
     let history: Vec<String> = match &conn {
         Some(conn) => conn
-            .prepare("SELECT cmd FROM history WHERE cmd LIKE ?1 || '%' ORDER BY started_at DESC LIMIT 200")
+            .prepare(
+                "SELECT cmd FROM history
+                 WHERE cmd LIKE ?1 || '%'
+                   AND cmd <> ?2
+                   AND exit_code = 0
+                   AND sensitive = 0
+                 ORDER BY started_at DESC, id DESC LIMIT 200",
+            )
             .map_err(|e| format!("history: {e}"))?
-            .query_map([first], |r| r.get(0))
+            .query_map([first.as_str(), cmd.as_str()], |r| r.get(0))
             .map_err(|e| format!("history: {e}"))?
             .collect::<Result<_, _>>()
             .map_err(|e| format!("history: {e}"))?,

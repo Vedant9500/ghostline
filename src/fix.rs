@@ -1,14 +1,14 @@
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::redact;
+use crate::shell;
 
 /// Longest single word we will fuzzy-match. Command and path names are far
 /// shorter; the cap keeps a pathological token from allocating a huge matrix.
 const MAX_WORD_LEN: usize = 200;
-
-/// Upper bound on names collected from `PATH`, matching `complete.rs`.
-const MAX_PATH_BINS: usize = 20_000;
 
 /// Optimal string alignment distance (Damerau-Levenshtein restricted to
 /// adjacent transpositions). Case-insensitive: caller lowercases first;
@@ -132,20 +132,6 @@ pub fn best<'a>(
     best.map(|(c, _, _, _, _, _)| c)
 }
 
-const SHELL_BUILTINS: &[&str] = &[
-    "cd", "echo", "export", "alias", "unalias", "source", ".", "exit", "return", "set", "unset",
-    "shift", "test", "[", "pwd", "jobs", "fg", "bg", "kill", "wait", "read", "printf", "true",
-    "false", "type", "command", "exec", "eval", "trap", "umask", "history", "fc", "let", "declare",
-    "local", "readonly", "pushd", "popd", "dirs", "suspend", "ulimit", "bind", "shopt", "complete",
-    "builtin",
-];
-
-/// Shell syntax that must never be treated as a command name.
-const SHELL_RESERVED: &[&str] = &[
-    "!", "{", "}", "[[", "]]", "if", "then", "elif", "else", "fi", "for", "while", "until", "do",
-    "done", "case", "esac", "in", "function", "select", "time", "coproc",
-];
-
 fn is_assignment(word: &str) -> bool {
     let Some((name, _)) = word.split_once('=') else {
         return false;
@@ -159,7 +145,7 @@ fn is_assignment(word: &str) -> bool {
 }
 
 fn is_shell_syntax(word: &str) -> bool {
-    SHELL_RESERVED.contains(&word) || is_assignment(word)
+    shell::is_reserved(word) || is_assignment(word)
 }
 
 /// Verbs seen in history (first tokens), for command-name correction.
@@ -169,6 +155,7 @@ pub fn history_verbs(history: &[String]) -> Vec<&str> {
     for h in history {
         if let Some(v) = h.split_whitespace().next()
             && !is_shell_syntax(v)
+            && is_displayable(v)
             && seen.insert(v)
         {
             out.push(v);
@@ -188,62 +175,9 @@ pub fn known_command(prog: &str, cwd: &str, path_bins: &BTreeSet<String>) -> boo
         } else {
             Path::new(cwd).join(path)
         };
-        return is_executable(&full);
+        return shell::is_executable(&full);
     }
-    SHELL_BUILTINS.contains(&prog) || path_bins.contains(prog)
-}
-
-fn is_executable(path: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path)
-            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::metadata(path)
-            .map(|m| m.is_file())
-            .unwrap_or(false)
-    }
-}
-
-/// Collect executable basenames from `$PATH` (one scandir per dir, no
-/// recursion). Sorted and capped so candidate order is deterministic and a
-/// hostile `PATH` cannot make a suggestion unbounded.
-pub fn path_bins() -> BTreeSet<String> {
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    path_bins_from(&path)
-}
-
-/// Testable PATH scanner; production calls `path_bins`.
-pub fn path_bins_from(path: &std::ffi::OsStr) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    for dir in std::env::split_paths(path) {
-        // An empty component means the cwd; never suggest random cwd files.
-        if dir.as_os_str().is_empty() {
-            continue;
-        }
-        let Ok(rd) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for ent in rd.flatten() {
-            let Some(name) = ent.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            if name.is_empty() || out.contains(&name) {
-                continue;
-            }
-            if is_executable(&ent.path()) {
-                out.insert(name);
-            }
-            if out.len() >= MAX_PATH_BINS {
-                return out;
-            }
-        }
-    }
-    out
+    shell::is_builtin(prog) || path_bins.contains(prog)
 }
 
 const GIT_SUBCOMMANDS: &[&str] = &[
@@ -288,19 +222,59 @@ const GIT_SUBCOMMANDS: &[&str] = &[
     "gc",
 ];
 
-/// Branches in cwd's repo (empty outside a repo — fails fast, no output parsed on error).
-pub fn git_branches(cwd: &str) -> Vec<String> {
-    let out = std::process::Command::new("git")
-        .args(["-C", cwd, "branch", "--format=%(refname:short)"])
-        .output();
-    match out {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
-            .lines()
-            .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty())
-            .collect(),
-        _ => vec![],
+/// Keep `fix` responsive even when git is slow or the repository is huge.
+const GIT_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Run a command with a hard timeout. `std` has no built-in timeout, so poll
+/// `try_wait` and kill the child when the deadline passes.
+fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Result<Output, String> {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| format!("spawn: {e}"))?;
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().map_err(|e| format!("wait: {e}")),
+            Ok(None) if start.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("timed out after {}ms", timeout.as_millis()));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("wait: {e}"));
+            }
+        }
     }
+}
+
+/// Branches, tags (checkout only), and remote-tracking refs in `cwd`'s repo.
+/// Returns an error for a missing git or a broken repository instead of
+/// silently pretending there are no refs.
+fn git_refs(cwd: &str, include_tags_and_remotes: bool) -> Result<Vec<String>, String> {
+    let mut cmd = Command::new("git");
+    cmd.args(["-C", cwd, "for-each-ref", "--format=%(refname:short)"]);
+    cmd.arg("refs/heads");
+    if include_tags_and_remotes {
+        cmd.arg("refs/tags");
+        cmd.arg("refs/remotes");
+    }
+    cmd.env("GIT_OPTIONAL_LOCKS", "0");
+    let out = run_with_timeout(cmd, GIT_TIMEOUT)?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("git for-each-ref failed: {}", err.trim()));
+    }
+    let mut refs: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.ends_with("/HEAD"))
+        .map(str::to_owned)
+        .collect();
+    refs.sort();
+    refs.dedup();
+    Ok(refs)
 }
 
 /// A shell word with both its unquoted value and the exact source spelling.
@@ -695,11 +669,7 @@ fn git_branch_operand(toks: &[&str], sub_idx: usize, cwd: &str) -> Option<usize>
             };
             continue;
         }
-        if t.contains('/')
-            || t.contains('.')
-            || t.starts_with('~')
-            || Path::new(cwd).join(t).exists()
-        {
+        if t.starts_with('~') || Path::new(cwd).join(t).exists() {
             return None;
         }
         return Some(i);
@@ -814,7 +784,7 @@ fn flag_index(toks: &[&str]) -> Option<usize> {
 /// True when a token could be a command name that needs a `PATH` lookup.
 /// Builtins, shell syntax, and explicit paths never do.
 fn needs_path_lookup(word: &str) -> bool {
-    !word.contains('/') && !SHELL_BUILTINS.contains(&word) && !is_shell_syntax(word)
+    !word.contains('/') && !shell::is_builtin(word) && !is_shell_syntax(word)
 }
 
 /// True when `flag` appears as a short option, including clusters like `-pv`.
@@ -881,7 +851,7 @@ fn suggest_with_context(
     let bins: &BTreeSet<String> = match bins {
         Some(bins) => bins,
         None if needs_path_lookup(toks[0]) => {
-            owned_bins = path_bins();
+            owned_bins = shell::path_bins();
             &owned_bins
         }
         None => &empty_bins,
@@ -912,7 +882,7 @@ fn suggest_with_context(
         let verbs = history_verbs(history);
         let preferred: HashSet<&str> = verbs.iter().copied().collect();
         let mut pool: Vec<&str> = bins.iter().map(String::as_str).collect();
-        pool.extend_from_slice(SHELL_BUILTINS);
+        pool.extend_from_slice(shell::BUILTINS);
         pool.extend(verbs);
         // Never offer the failed token back as its own correction. History
         // can legitimately contain it (e.g. the current failed command).
@@ -938,12 +908,20 @@ fn suggest_with_context(
             && let Some(arg_idx) = git_branch_operand(&toks, sub_idx, cwd)
         {
             let branch_arg = toks[arg_idx];
-            let branches = git_branches(cwd);
-            if !branches.is_empty() && !branches.iter().any(|b| b == branch_arg) {
-                let refs: Vec<&str> = branches.iter().map(|s| s.as_str()).collect();
-                if let Some(hit) = best(branch_arg, refs, &no_pref) {
-                    out.push(render_with(&tokens, &[(arg_idx, shell_quote(hit))]));
+            // `checkout` accepts tags and remote refs; `switch` only accepts
+            // local branches (remote refs need an explicit --detach).
+            match git_refs(cwd, sub == "checkout") {
+                Ok(refs)
+                    if !refs.is_empty()
+                        && !refs.iter().any(|candidate| candidate == branch_arg) =>
+                {
+                    let refs: Vec<&str> = refs.iter().map(String::as_str).collect();
+                    if let Some(hit) = best(branch_arg, refs, &no_pref) {
+                        out.push(render_with(&tokens, &[(arg_idx, shell_quote(hit))]));
+                    }
                 }
+                Ok(_) => {}
+                Err(e) => eprintln!("ghostline fix: warning: git refs unavailable: {e}"),
             }
         }
     }
@@ -1272,33 +1250,33 @@ mod tests {
 
     #[test]
     fn swapped_order() {
-        let out = suggest("checkout git main", "/tmp", &[]);
-        assert!(out.iter().any(|s| s == "git checkout main"));
+        let dir = tmp_dir("swap");
+        let cwd = dir.to_string_lossy().into_owned();
+        let out = suggest("checkout git main", &cwd, &[]);
+        assert!(out.iter().any(|s| s == "git checkout main"), "got: {out:?}");
     }
 
     #[test]
     fn cd_case_fixed() {
-        let dir = std::env::temp_dir().join(format!("gl-fixtest-{}", std::process::id()));
+        let dir = tmp_dir("fixtest");
         std::fs::create_dir_all(dir.join("Downloads")).unwrap();
         let cwd = dir.to_string_lossy().into_owned();
         let out = suggest("cd downloads", &cwd, &[]);
         assert!(out.iter().any(|s| s == "cd Downloads"), "got: {out:?}");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn path_typo_fixed() {
-        let dir = std::env::temp_dir().join(format!("gl-fixtypo-{}", std::process::id()));
+        let dir = tmp_dir("fixtypo");
         std::fs::create_dir_all(dir.join("Documents")).unwrap();
         let cwd = dir.to_string_lossy().into_owned();
         let out = suggest("cd Documnets", &cwd, &[]);
         assert!(out.iter().any(|s| s == "cd Documents"), "got: {out:?}");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn path_typo_preserves_multi_component_suffix() {
-        let dir = std::env::temp_dir().join(format!("gl-fixsuffix-{}", std::process::id()));
+        let dir = tmp_dir("fixsuffix");
         std::fs::create_dir_all(dir.join("Documents/sub")).unwrap();
         std::fs::create_dir_all(dir.join("Downloads/sub")).unwrap();
         std::fs::create_dir_all(dir.join("sun")).unwrap();
@@ -1319,8 +1297,6 @@ mod tests {
             !out.iter().any(|s| s == "cd Downloads"),
             "truncated path: {out:?}"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1344,13 +1320,15 @@ mod tests {
 
     #[test]
     fn git_subcommand_fixed() {
-        let out = suggest("git chekout main", "/tmp", &[]);
+        let dir = tmp_dir("gitsub");
+        let cwd = dir.to_string_lossy().into_owned();
+        let out = suggest("git chekout main", &cwd, &[]);
         assert!(out.iter().any(|s| s == "git checkout main"), "got: {out:?}");
     }
 
     #[test]
     fn mkdir_p_suggested() {
-        let dir = std::env::temp_dir().join(format!("gl-fixmkdir-{}", std::process::id()));
+        let dir = tmp_dir("fixmkdir");
         std::fs::create_dir_all(&dir).unwrap();
         let cwd = dir.to_string_lossy().into_owned();
         let out = suggest("touch a/b/c.txt", &cwd, &[]);
@@ -1359,7 +1337,6 @@ mod tests {
                 .any(|s| s.starts_with("mkdir -p") && s.contains("touch a/b/c.txt")),
             "got: {out:?}"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1416,9 +1393,22 @@ mod tests {
             git_branch_operand(&["git", "checkout", "--", "mian"], 1, "/tmp"),
             None
         );
+        let path_dir = tmp_dir("gitpath");
+        std::fs::write(path_dir.join("main.c"), "x").unwrap();
+        let path_cwd = path_dir.to_string_lossy().into_owned();
         assert_eq!(
-            git_branch_operand(&["git", "checkout", "main.c"], 1, "/tmp"),
+            git_branch_operand(&["git", "checkout", "main.c"], 1, &path_cwd),
             None
+        );
+        // A ref name may contain dots (tags commonly do) or slashes (remote
+        // refs); only an existing path is rejected.
+        assert_eq!(
+            git_branch_operand(&["git", "checkout", "v1.1"], 1, &path_cwd),
+            Some(2)
+        );
+        assert_eq!(
+            git_branch_operand(&["git", "checkout", "origin/mian"], 1, &path_cwd),
+            Some(2)
         );
         assert_eq!(
             git_branch_operand(&["git", "checkout", "-q", "mian"], 1, "/tmp"),
@@ -1443,7 +1433,7 @@ mod tests {
 
     #[test]
     fn quoted_paths_and_flags_are_repaired_safely() {
-        let dir = std::env::temp_dir().join(format!("gl-fixquoted-{}", std::process::id()));
+        let dir = tmp_dir("fixquoted");
         std::fs::create_dir_all(dir.join("My Docs")).unwrap();
         std::fs::create_dir_all(dir.join("Downloads")).unwrap();
         let cwd = dir.to_string_lossy().into_owned();
@@ -1467,18 +1457,15 @@ mod tests {
                 .any(|s| s == "mkdir -p 'My Dir' && touch -m \"My Dir/file\""),
             "got: {out:?}"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn leading_dash_path_is_rendered_as_a_path() {
-        let dir = std::env::temp_dir().join(format!("gl-fixdash-{}", std::process::id()));
+        let dir = tmp_dir("fixdash");
         std::fs::create_dir_all(dir.join("-Downloads")).unwrap();
         let cwd = dir.to_string_lossy().into_owned();
         let out = suggest("cd -downloads", &cwd, &[]);
         assert!(out.iter().any(|s| s == "cd ./-Downloads"), "got: {out:?}");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1501,6 +1488,88 @@ mod tests {
             out.iter().any(|s| s == "git -C /tmp checkout"),
             "got: {out:?}"
         );
+    }
+
+    fn git_ok(dir: &Path, args: &[&str]) -> bool {
+        Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false)
+    }
+
+    fn git_available() -> bool {
+        Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn git_refs_cover_branches_tags_and_remotes() {
+        if !git_available() {
+            eprintln!("SKIP git_refs_cover_branches_tags_and_remotes: no git");
+            return;
+        }
+        let dir = tmp_dir("gitrefs");
+        if !git_ok(&dir, &["init", "-q"])
+            || !git_ok(&dir, &["symbolic-ref", "HEAD", "refs/heads/main"])
+            || !git_ok(&dir, &["commit", "--allow-empty", "-qm", "init"])
+        {
+            eprintln!("SKIP git_refs_cover_branches_tags_and_remotes: cannot seed repo");
+            return;
+        }
+        assert!(git_ok(&dir, &["tag", "v1.0"]));
+        assert!(git_ok(
+            &dir,
+            &["update-ref", "refs/remotes/origin/feature", "HEAD"]
+        ));
+
+        let cwd = dir.to_string_lossy().into_owned();
+        let refs = git_refs(&cwd, true).expect("refs");
+        assert!(refs.contains(&"main".to_string()), "{refs:?}");
+        assert!(refs.contains(&"v1.0".to_string()), "{refs:?}");
+        assert!(refs.contains(&"origin/feature".to_string()), "{refs:?}");
+
+        let switch_refs = git_refs(&cwd, false).expect("refs");
+        assert!(
+            !switch_refs.contains(&"v1.0".to_string()),
+            "{switch_refs:?}"
+        );
+
+        let out = suggest("git checkout mian", &cwd, &[]);
+        assert!(out.iter().any(|s| s == "git checkout main"), "got: {out:?}");
+        let out = suggest("git checkout v1.1", &cwd, &[]);
+        assert!(out.iter().any(|s| s == "git checkout v1.0"), "got: {out:?}");
+        let out = suggest("git switch mian", &cwd, &[]);
+        assert!(out.iter().any(|s| s == "git switch main"), "got: {out:?}");
+        let out = suggest("git switch v1.1", &cwd, &[]);
+        assert!(
+            !out.iter().any(|s| s.contains("v1.0")),
+            "switch offered a tag: {out:?}"
+        );
+        let out = suggest("git checkout origin/featre", &cwd, &[]);
+        assert!(
+            out.iter().any(|s| s == "git checkout origin/feature"),
+            "got: {out:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_with_timeout_kills_a_hung_child() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 5"]);
+        let start = Instant::now();
+        let err = run_with_timeout(cmd, Duration::from_millis(50)).unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+        assert!(start.elapsed() < Duration::from_secs(2), "took too long");
     }
 
     #[test]
@@ -1539,6 +1608,24 @@ mod tests {
     }
 
     #[test]
+    fn control_characters_never_reach_candidates() {
+        let out = suggest("cd bad\u{1b}[31m", "/tmp", &[]);
+        assert!(out.is_empty(), "control input produced {out:?}");
+        let history = vec!["ls --co\u{1b}lor".to_string()];
+        let out = suggest("ls --colr", "/tmp", &history);
+        assert!(
+            out.iter().all(|s| !s.chars().any(char::is_control)),
+            "control leaked: {out:?}"
+        );
+        let history = vec!["l\u{1b}s".to_string()];
+        let out = suggest("lz", "/tmp", &history);
+        assert!(
+            out.iter().all(|s| !s.chars().any(char::is_control)),
+            "history verb control leaked: {out:?}"
+        );
+    }
+
+    #[test]
     fn no_absurd_suggestions() {
         let out = suggest("rm -rf / tmp/foo", "/tmp", &[]);
         assert!(!out.iter().any(|s| s.contains("rm")), "got: {out:?}");
@@ -1548,10 +1635,39 @@ mod tests {
 
     // ---- Medium-finding regressions -------------------------------------
 
-    fn tmp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("gl-{tag}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("gl-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl std::ops::Deref for TempDir {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<Path> for TempDir {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tmp_dir(tag: &str) -> TempDir {
+        TempDir::new(tag)
     }
 
     fn fake_bins(names: &[&str]) -> BTreeSet<String> {
@@ -1651,10 +1767,9 @@ mod tests {
         std::fs::write(dir.join("plain.txt"), "x").unwrap();
         std::fs::create_dir_all(dir.join("adir")).unwrap();
 
-        let bins = path_bins_from(dir.as_os_str());
+        let bins = crate::shell::path_bins_from(dir.as_os_str());
         let names: Vec<&str> = bins.iter().map(String::as_str).collect();
         assert_eq!(names, ["fooa", "foob"]);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1681,7 +1796,6 @@ mod tests {
             "non-executable accepted"
         );
         assert!(!known_command("./missing", &cwd, &empty));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1697,7 +1811,6 @@ mod tests {
 
         let out = suggest("mkdir -m 700 a/b", &cwd, &[]);
         assert_eq!(out, vec!["mkdir -p -m 700 a/b"], "got: {out:?}");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1728,7 +1841,6 @@ mod tests {
         // `-t` here is the value of `-S`, not a target-directory option.
         let out = suggest("cp -S -t file", &cwd, &[]);
         assert!(out.is_empty(), "option value treated as target: {out:?}");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1738,17 +1850,14 @@ mod tests {
         let cwd = dir.to_string_lossy().into_owned();
         let out = suggest("cd downloads", &cwd, &[]);
         assert!(out.is_empty(), "file accepted as cd target: {out:?}");
-        std::fs::remove_dir_all(&dir).ok();
 
         let home = tmp_dir("home");
         std::fs::create_dir_all(home.join("Downloads")).unwrap();
         let work = tmp_dir("work");
         let cwd = work.to_string_lossy().into_owned();
         let bins = BTreeSet::new();
-        let out = with_context("cd ~/downloads", &cwd, &bins, Some(home.as_path()), 1000);
+        let out = with_context("cd ~/downloads", &cwd, &bins, Some(home.as_ref()), 1000);
         assert!(out.iter().any(|s| s == "cd ~/Downloads"), "got: {out:?}");
-        std::fs::remove_dir_all(&home).ok();
-        std::fs::remove_dir_all(&work).ok();
     }
 
     #[test]
@@ -1799,8 +1908,6 @@ mod tests {
             1000,
         );
         assert!(!out.iter().any(|s| s.starts_with("sudo")), "got: {out:?}");
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1844,7 +1951,5 @@ mod tests {
         std::fs::create_dir_all(dir.join("reports")).unwrap();
         let out = suggest("cat repotrs", &cwd, &[]);
         assert!(out.is_empty(), "directory accepted for cat: {out:?}");
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

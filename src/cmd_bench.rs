@@ -266,8 +266,9 @@ pub fn run(opts: &BenchOpts) -> Result<BenchReport, String> {
         .map(|s| s == "ghostline")
         .unwrap_or(false);
     let (hook_ms_p50, hook_ms_p99, hook_subprocess) = if exe_is_ghostline {
-        let mut hook_ms = Vec::with_capacity(reps.min(10).max(1));
-        for _ in 0..reps.min(10).max(1) {
+        let reps = reps.clamp(1, 10);
+        let mut hook_ms = Vec::with_capacity(reps);
+        for _ in 0..reps {
             let t = Instant::now();
             let out = std::process::Command::new(&exe)
                 .args(["suggest", "--db"])

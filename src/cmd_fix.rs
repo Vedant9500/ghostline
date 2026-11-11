@@ -1,8 +1,9 @@
 use crate::{db, fix, redact};
 
-/// `ghostline fix [--last] [--exit CODE] [--cwd DIR] [--db P] [-q] [command...]`
+/// `ghostline fix [--last] [--exit CODE] [--cwd DIR] [--db P] [-q] [--] [command...]`
 /// Prints up to 3 `did you mean` candidates (human format), or just the top
-/// candidate with -q (for `Enter to run` wiring). Exit 0 = found, 1 = none.
+/// candidate with `-q` for scripting. Nothing is executed. Exit 0 = found,
+/// 1 = none or error.
 pub fn run(args: &[String]) -> Result<(), String> {
     let mut last = false;
     let mut quiet = false;
@@ -13,31 +14,73 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--last" => last = true,
-            "-q" | "--quiet" => quiet = true,
-            "--exit" | "--exit-code" => {
-                i += 1;
-                exit_code = args.get(i).and_then(|s| s.parse().ok());
-            }
-            "--cwd" => {
-                i += 1;
-                cwd = args.get(i).cloned().unwrap_or_default();
-            }
-            "--db" => {
-                i += 1;
-                db_path = args.get(i).cloned();
-            }
             "--" => {
                 cmd_parts.extend_from_slice(&args[i + 1..]);
                 break;
             }
-            s if s.starts_with("--") => return Err(format!("unknown flag '{s}'")),
-            _ => cmd_parts.push(args[i].clone()),
+            "--last" => last = true,
+            "-q" | "--quiet" => quiet = true,
+            "--exit" | "--exit-code" => {
+                let flag = args[i].clone();
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| format!("{flag} requires a value"))?;
+                let code: i64 = value
+                    .parse()
+                    .map_err(|_| format!("invalid exit code '{value}'"))?;
+                if !(0..=255).contains(&code) {
+                    return Err(format!("exit code out of range: {code}"));
+                }
+                exit_code = Some(code);
+                i += 1;
+            }
+            "--cwd" => {
+                let value = args
+                    .get(i + 1)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| "--cwd requires a non-empty value".to_string())?;
+                cwd = value.clone();
+                i += 1;
+            }
+            "--db" => {
+                let value = args
+                    .get(i + 1)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| "--db requires a non-empty value".to_string())?;
+                db_path = Some(value.clone());
+                i += 1;
+            }
+            flag if flag.starts_with('-') && flag != "-" => {
+                return Err(format!("unknown flag '{flag}'"));
+            }
+            _ => {
+                // The first non-option starts the command; anything after it
+                // is an argument, even if it looks like a flag.
+                cmd_parts.extend_from_slice(&args[i..]);
+                break;
+            }
         }
         i += 1;
     }
-    let path = db_path.map(std::path::PathBuf::from).unwrap_or_else(db::default_db_path);
-    let conn = db::open_read(&path).map_err(|e| format!("open db: {e}"))?;
+    if last && !cmd_parts.is_empty() {
+        return Err("--last cannot be combined with an explicit command".into());
+    }
+    if last && exit_code.is_some() {
+        return Err("--last cannot be combined with --exit".into());
+    }
+
+    let path = db_path
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(db::default_db_path);
+    let conn = match db::open_read(&path) {
+        Ok(conn) => conn,
+        Err(e) if last => return Err(format!("open db: {e}")),
+        Err(e) => {
+            // History is context, not a prerequisite for filesystem rules.
+            eprintln!("ghostline fix: warning: cannot read history database: {e}");
+            None
+        }
+    };
 
     // Resolve target command: explicit args, or most recent non-zero-exit row.
     let (cmd, cwd, exit, sensitive) = if last {
@@ -70,7 +113,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
         (cmd, cwd.clone(), exit_code, sensitive)
     };
     let cwd = if cwd.is_empty() {
-        std::env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()
+        std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default()
     } else {
         cwd
     };
@@ -85,20 +130,27 @@ pub fn run(args: &[String]) -> Result<(), String> {
     // commands sharing the first token, excluding the command being repaired.
     let first = cmd.split_whitespace().next().unwrap_or("").to_string();
     let history: Vec<String> = match &conn {
-        Some(conn) => conn
-            .prepare(
-                "SELECT cmd FROM history
-                 WHERE cmd LIKE ?1 || '%'
-                   AND cmd <> ?2
-                   AND exit_code = 0
-                   AND sensitive = 0
-                 ORDER BY started_at DESC, id DESC LIMIT 200",
-            )
-            .map_err(|e| format!("history: {e}"))?
-            .query_map([first.as_str(), cmd.as_str()], |r| r.get(0))
-            .map_err(|e| format!("history: {e}"))?
-            .collect::<Result<_, _>>()
-            .map_err(|e| format!("history: {e}"))?,
+        Some(conn) => {
+            let rows = (|| -> rusqlite::Result<Vec<String>> {
+                let mut stmt = conn.prepare(
+                    "SELECT cmd FROM history
+                     WHERE cmd LIKE ?1 || '%'
+                       AND cmd <> ?2
+                       AND exit_code = 0
+                       AND sensitive = 0
+                     ORDER BY started_at DESC, id DESC LIMIT 200",
+                )?;
+                stmt.query_map([first.as_str(), cmd.as_str()], |r| r.get(0))?
+                    .collect()
+            })();
+            match rows {
+                Ok(rows) => rows,
+                Err(e) => {
+                    eprintln!("ghostline fix: warning: history query failed: {e}");
+                    Vec::new()
+                }
+            }
+        }
         None => Vec::new(),
     };
 
@@ -114,7 +166,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     } else {
         for (n, c) in cands.iter().enumerate() {
             if n == 0 {
-                println!("did you mean: {c}?  [Enter run | e edit | d dismiss]");
+                println!("did you mean: {c}?");
             } else {
                 println!("  also: {c}");
             }

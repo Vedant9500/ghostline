@@ -218,11 +218,7 @@ pub fn is_destructive(cmd: &str) -> bool {
                     return true;
                 }
             }
-            "dd" => {
-                if lower_tokens[i + 1..].iter().any(|a| a.starts_with("of=")) {
-                    return true;
-                }
-            }
+            "dd" if lower_tokens[i + 1..].iter().any(|a| a.starts_with("of=")) => return true,
             _ => {}
         }
     }
@@ -235,7 +231,7 @@ pub fn is_ignored(cmd: &str, ignore_env: Option<&str>) -> bool {
         return true; // mirrors HISTCONTROL=ignorespace
     }
     if let Some(env) = ignore_env {
-        for pat in env.split(|c| c == ',' || c == ':' || c == '\n') {
+        for pat in env.split([',', ':', '\n']) {
             let pat = pat.trim();
             if pat.is_empty() {
                 continue;

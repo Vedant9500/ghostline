@@ -113,7 +113,7 @@ mod tests {
         append(&dir, &sample("cargo test")).unwrap();
         let claimed = claim(&dir).expect("queue claimed");
         assert!(
-            queue_file(&dir).exists() == false
+            !queue_file(&dir).exists()
                 || std::fs::metadata(queue_file(&dir))
                     .map(|m| m.len())
                     .unwrap_or(0)

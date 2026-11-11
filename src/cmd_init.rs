@@ -1,6 +1,5 @@
 /// Shell snippets printed by `ghostline init <bash|zsh|fish>`.
 /// Idempotent, append-safe, honor GHOSTLINE_DISABLED. Binary does ignore/redact.
-
 pub fn snippet(shell: &str) -> Result<&'static str, String> {
     match shell {
         "bash" => Ok(BASH),
@@ -403,13 +402,21 @@ mod tests {
         // installed system-wide, which would flip the snippet into native
         // mode (no shell binds). Force fallback to test the shell path.
         let out = std::process::Command::new("bash")
-            .args(["--norc", "-i", "-c", &format!("unset _GHOSTLINE_GHOST_INITED; source {snip_s}; bind -m emacs -X")])
+            .args([
+                "--norc",
+                "-i",
+                "-c",
+                &format!("unset _GHOSTLINE_GHOST_INITED; source {snip_s}; bind -m emacs -X"),
+            ])
             .env("PATH", "/usr/bin:/bin")
             .stdin(Stdio::null())
             .output()
             .expect("bash -i bind -X");
         let listing = String::from_utf8_lossy(&out.stdout);
-        let nkeys = listing.lines().filter(|l| l.contains("_ghostline_k_")).count();
+        let nkeys = listing
+            .lines()
+            .filter(|l| l.contains("_ghostline_k_"))
+            .count();
         assert!(
             nkeys == 0,
             "per-char bindings cause whole-line refresh flicker, must be 0 (got {nkeys}):\n{listing}"
@@ -436,9 +443,18 @@ mod tests {
         // Background logging must not leak job notices into the prompt:
         // bash uses subshell-wrap `( ... & )` (bare `&` prints "[1]+ Done";
         // `& disown` still prints the "[1] pid" startup line — both verified).
-        assert!(snippet("bash").unwrap().contains("& )"), "bash logger must be silent");
-        assert!(snippet("zsh").unwrap().contains("&!"), "zsh must disown logger");
-        assert!(snippet("fish").unwrap().contains("disown"), "fish must disown logger");
+        assert!(
+            snippet("bash").unwrap().contains("& )"),
+            "bash logger must be silent"
+        );
+        assert!(
+            snippet("zsh").unwrap().contains("&!"),
+            "zsh must disown logger"
+        );
+        assert!(
+            snippet("fish").unwrap().contains("disown"),
+            "fish must disown logger"
+        );
         // unused import guard
         let _ = super::header().len() + snippet("zsh").unwrap().len();
     }

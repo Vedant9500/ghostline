@@ -4,7 +4,12 @@
 
 fn python() -> Option<String> {
     for cand in ["python3", "python"] {
-        if std::process::Command::new(cand).arg("--version").output().map(|o| o.status.success()).unwrap_or(false) {
+        if std::process::Command::new(cand)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
             return Some(cand.into());
         }
     }
@@ -18,14 +23,22 @@ fn bash_ghost_pty() {
         return;
     };
     let bin = env!("CARGO_BIN_EXE_ghostline");
-    let bindir = std::path::Path::new(bin).parent().unwrap().to_string_lossy().into_owned();
+    let bindir = std::path::Path::new(bin)
+        .parent()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let mut workdir = std::env::temp_dir();
     workdir.push(format!("gl-pty-{}", std::process::id()));
     std::fs::create_dir_all(&workdir).unwrap();
 
     // fresh snippet from the binary under test
-    let init = std::process::Command::new(bin).arg("init").arg("bash").output().expect("init bash");
+    let init = std::process::Command::new(bin)
+        .arg("init")
+        .arg("bash")
+        .output()
+        .expect("init bash");
     assert!(init.status.success());
     let snip = workdir.join("snip.bash");
     std::fs::write(&snip, &init.stdout).unwrap();
@@ -40,8 +53,14 @@ fn bash_ghost_pty() {
         .expect("run ghost_pty.py");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "ghost_pty.py failed:\n{stdout}\n{stderr}");
-    assert!(stdout.contains("RESULT: OK"), "unexpected output:\n{stdout}");
+    assert!(
+        out.status.success(),
+        "ghost_pty.py failed:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("RESULT: OK"),
+        "unexpected output:\n{stdout}"
+    );
     std::fs::remove_dir_all(&workdir).ok();
 }
 
@@ -49,7 +68,7 @@ fn bash_ghost_pty() {
 /// ~0 full-line redraws. Builds the .so with cc when available, else skips
 /// gracefully (like the python skip above). Uses a fake install dir (binary
 /// + .so side by side) so the snippet takes its real pure-C path, exactly
-/// like a user install. Proves auto without flicker, including fast bursts.
+///   like a user install. Proves auto without flicker, including fast bursts.
 #[test]
 fn bash_ghost_pty_auto() {
     let Some(py) = python() else {
@@ -97,7 +116,10 @@ fn bash_ghost_pty_auto() {
     let init = std::process::Command::new(bin)
         .arg("init")
         .arg("bash")
-        .env("PATH", format!("{install_s}:{}", std::env::var("PATH").unwrap_or_default()))
+        .env(
+            "PATH",
+            format!("{install_s}:{}", std::env::var("PATH").unwrap_or_default()),
+        )
         .output()
         .expect("init bash");
     assert!(init.status.success());
@@ -115,7 +137,10 @@ fn bash_ghost_pty_auto() {
         .expect("run ghost_pty_auto.py");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "ghost_pty_auto.py failed:\n{stdout}\n{stderr}");
+    assert!(
+        out.status.success(),
+        "ghost_pty_auto.py failed:\n{stdout}\n{stderr}"
+    );
     assert!(
         stdout.contains("RESULT: OK") || stdout.contains("SKIP"),
         "unexpected output:\n{stdout}"
@@ -173,7 +198,10 @@ fn bash_ghost_pty_wrap() {
     let init = std::process::Command::new(bin)
         .arg("init")
         .arg("bash")
-        .env("PATH", format!("{install_s}:{}", std::env::var("PATH").unwrap_or_default()))
+        .env(
+            "PATH",
+            format!("{install_s}:{}", std::env::var("PATH").unwrap_or_default()),
+        )
         .output()
         .expect("init bash");
     assert!(init.status.success());
@@ -190,7 +218,13 @@ fn bash_ghost_pty_wrap() {
         .expect("run ghost_pty_wrap.py");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "ghost_pty_wrap.py failed:\n{stdout}\n{stderr}");
-    assert!(stdout.contains("RESULT: OK"), "unexpected output:\n{stdout}");
+    assert!(
+        out.status.success(),
+        "ghost_pty_wrap.py failed:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("RESULT: OK"),
+        "unexpected output:\n{stdout}"
+    );
     std::fs::remove_dir_all(&workdir).ok();
 }

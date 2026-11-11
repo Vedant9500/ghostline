@@ -8,69 +8,14 @@
 //! Scope (v1): first-token position only (buffer without whitespace).
 //! Argument/flag/file completion is deferred.
 
-use std::collections::BTreeSet;
+use std::ffi::OsStr;
 
-/// Bash builtins + reserved words (static; aliases/functions need the live
-/// shell and are unavailable out-of-process).
-const BUILTINS: &[&str] = &[
-    "alias", "bg", "bind", "break", "builtin", "caller", "case", "cd", "command", "compgen",
-    "complete", "compopt", "continue", "coproc", "declare", "dirs", "disown", "do", "done",
-    "echo", "elif", "else", "enable", "esac", "eval", "exec", "exit", "export", "false", "fc",
-    "fg", "fi", "for", "function", "getopts", "hash", "help", "history", "if", "in", "jobs",
-    "kill", "let", "local", "logout", "mapfile", "popd", "printf", "pushd", "pwd", "read",
-    "readarray", "return", "select", "set", "shift", "shopt", "source", "suspend", "test",
-    "then", "time", "times", "trap", "true", "type", "typeset", "ulimit", "umask", "unalias",
-    "unset", "until", "wait", "while",
-];
-
-fn is_executable(path: &std::path::Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path)
-            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::metadata(path).map(|m| m.is_file()).unwrap_or(false)
-    }
-}
-
-/// All known command names: `PATH` executables ∪ builtins, sorted + deduped.
-/// Empty `PATH` entries (meaning cwd) are skipped — never suggest random cwd files.
+/// All known command names: `PATH` executables ∪ builtins ∪ reserved words,
+/// sorted + deduped. Shared with typo repair via [`crate::shell`].
 /// `path_override` is for tests (avoids mutating process-wide `PATH`, which
 /// cargo shares across parallel test threads); production passes `None`.
-pub fn command_names_from(path_override: Option<&std::ffi::OsStr>) -> Vec<String> {
-    let mut set = BTreeSet::new();
-    let path = path_override.map(|s| s.to_os_string()).or_else(|| std::env::var_os("PATH"));
-    if let Some(path) = path {
-        for dir in std::env::split_paths(&path) {
-            if dir.as_os_str().is_empty() {
-                continue;
-            }
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let Some(name) = name.to_str() else { continue };
-                if name.is_empty() || set.contains(name) {
-                    continue;
-                }
-                if is_executable(&entry.path()) {
-                    set.insert(name.to_string());
-                }
-                if set.len() >= 20_000 {
-                    break;
-                }
-            }
-        }
-    }
-    for b in BUILTINS {
-        set.insert(b.to_string());
-    }
-    set.into_iter().collect()
+pub fn command_names_from(path_override: Option<&OsStr>) -> Vec<String> {
+    crate::shell::command_names_from(path_override)
 }
 
 /// Full command-name candidates for `prefix` (excludes the exact match —
@@ -94,9 +39,26 @@ pub fn complete_command_in(prefix: &str, path: Option<&std::ffi::OsStr>) -> Vec<
 mod tests {
     use super::*;
 
-    fn fake_bin(names: &[&str]) -> std::path::PathBuf {
+    struct TempDir(std::path::PathBuf);
+
+    impl std::ops::Deref for TempDir {
+        type Target = std::path::Path;
+
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn fake_bin(names: &[&str]) -> TempDir {
         let mut dir = std::env::temp_dir();
         dir.push(format!("gl-comp-{}-{}", std::process::id(), names.len()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         for n in names {
             let p = dir.join(n);
@@ -115,7 +77,7 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o644)).unwrap();
         }
-        dir
+        TempDir(dir)
     }
 
     #[test]
@@ -123,18 +85,25 @@ mod tests {
         let dir = fake_bin(&["codex", "codiff", "other"]);
         let got = complete_command_in("co", Some(dir.as_os_str()));
         assert_eq!(&got[..2], ["codex", "codiff"]);
-        assert!(!got.iter().any(|c| c == "cosecret.txt"), "decoy excluded: {got:?}");
+        assert!(
+            !got.iter().any(|c| c == "cosecret.txt"),
+            "decoy excluded: {got:?}"
+        );
         assert!(!got.iter().any(|c| c == "other"), "prefix filter: {got:?}");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn completes_builtins() {
         let dir = fake_bin(&[]);
         let got = complete_command_in("comp", Some(dir.as_os_str()));
-        assert!(got.contains(&"complete".to_string()), "builtins included: {got:?}");
-        assert!(got.contains(&"compgen".to_string()), "builtins included: {got:?}");
-        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            got.contains(&"complete".to_string()),
+            "builtins included: {got:?}"
+        );
+        assert!(
+            got.contains(&"compgen".to_string()),
+            "builtins included: {got:?}"
+        );
     }
 
     #[test]
@@ -143,6 +112,5 @@ mod tests {
         let got = complete_command_in("codex", Some(dir.as_os_str()));
         assert!(!got.contains(&"codex".to_string()));
         assert!(complete_command_in("", Some(dir.as_os_str())).is_empty());
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

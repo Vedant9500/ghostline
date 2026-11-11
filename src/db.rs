@@ -928,6 +928,9 @@ fn short_match_strategy(conn: &Connection, query: &str) -> rusqlite::Result<Opti
     }
 }
 
+// The parameters mirror the SQL search filters one-for-one; grouping them
+// would only add a struct at every call site.
+#[allow(clippy::too_many_arguments)]
 pub fn search(
     conn: &Connection,
     query: &str,

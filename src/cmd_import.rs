@@ -27,11 +27,12 @@ pub fn parse_histfile(text: &str, fallback_ns: i64) -> Vec<(String, i64, usize, 
         if line.is_empty() {
             continue;
         }
-        if let Some(ts) = line.strip_prefix('#') {
-            if ts.len() == 10 && ts.bytes().all(|b| b.is_ascii_digit()) {
-                pending_ts = ts.parse::<i64>().ok().map(|s| s * 1_000_000_000);
-                continue;
-            }
+        if let Some(ts) = line.strip_prefix('#')
+            && ts.len() == 10
+            && ts.bytes().all(|b| b.is_ascii_digit())
+        {
+            pending_ts = ts.parse::<i64>().ok().map(|s| s * 1_000_000_000);
+            continue;
         }
         let cmd = crate::redact::clean_command(line);
         if cmd.is_empty() || cmd.starts_with("ghostline ") || cmd == "ghostline" {

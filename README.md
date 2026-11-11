@@ -114,7 +114,7 @@ With the shell ghost, `Ctrl-G` previews; `Right`/`Ctrl-F`/`End` accept at end of
 | `ghostline daemon [--once]` | Drain the queue once or in a loop | `--once`, `--interval-ms N`, `--queue-dir D`, `--db PATH` |
 | `ghostline import [--from HISTFILE]` | Bulk-import a bash history file; repeat runs dedupe | `--from HISTFILE`, `--shell S`, `--no-dedupe`, `--db PATH` |
 | `ghostline forget [flags] [PATTERN...]` | Delete matching history; preview with `--dry-run` | `--last-n N`, `--older-than DAYS`, `--max-rows N`, `--all`, `--dry-run`, `--vacuum`, `--db PATH` |
-| `ghostline fix [--last] [command...]` | Print `did you mean` candidates; exit 0 when found | `--last`, `--exit CODE`, `--cwd DIR`, `--db PATH`, `-q` |
+| `ghostline fix [--last] [--] [command...]` | Print `did you mean` candidates (never executes); exit 0 when found | `--last`, `--exit CODE`, `--cwd DIR`, `--db PATH`, `-q` |
 | `ghostline search [flags] [query]` | Search history and print TSV rows | `--limit N`, `--dir DIR`, `--exit N` or `!N`, `--session S`, `--host H`, `--since UNIX_SECS`, `--db PATH` |
 | `ghostline suggest [flags] <buffer>` | Print the next ghost suffix, or full commands with `--all` | `--cwd DIR`, `--limit N`, `--all`, `--db PATH` |
 | `ghostline bench [flags]` | Run measurements and optional gate | `--n N`, `--reps R`, `--concurrency C`, `--json`, `--db PATH`, `--gate`, `--max-log-ms X`, `--max-search-ms X`, `--max-suggest-ms X`, `--max-hook-ms X`, `--min-inserts-per-s X` |

@@ -12,6 +12,7 @@ mod db;
 mod fix;
 mod queue;
 mod redact;
+mod shell;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
